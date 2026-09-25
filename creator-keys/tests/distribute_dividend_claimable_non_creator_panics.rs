@@ -10,8 +10,6 @@ use soroban_sdk::Address;
 
 #[test]
 fn non_creator_call_is_rejected() {
-    // Use the mock-auth env so setup helpers (set_protocol_admin, set_fee_config,
-    // register_creator, ...) succeed.
     let env = test_env_with_auths();
 
     let (client, _id) = register_creator_keys(&env);
@@ -22,7 +20,6 @@ fn non_creator_call_is_rejected() {
         DEFAULT_CREATOR_BPS,
         DEFAULT_PROTOCOL_BPS,
     );
-
     let creator = register_test_creator_with_fee_config(
         &env,
         &client,
@@ -30,13 +27,10 @@ fn non_creator_call_is_rejected() {
         DEFAULT_CREATOR_BPS,
         DEFAULT_PROTOCOL_BPS,
     );
-
     let alice = Address::generate(&env);
     let holders = [(alice.clone(), 1u32)];
     setup_holders(&env, &client, &creator, &holders);
 
-    // Drop all mocked auths so creator.require_auth() inside
-    // distribute_dividend_claimable cannot be satisfied.
     env.mock_auths(&[]);
 
     let amounts = soroban_sdk::vec![&env, alice.clone()];
