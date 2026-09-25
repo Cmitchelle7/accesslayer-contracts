@@ -3,7 +3,7 @@
 mod contract_test_env;
 use contract_test_env::{register_creator_keys, test_env_with_auths};
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{Address, Error};
+use soroban_sdk::Address;
 
 #[test]
 fn claim_with_no_balance_errors() {
