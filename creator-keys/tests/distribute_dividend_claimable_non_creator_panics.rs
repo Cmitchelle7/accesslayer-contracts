@@ -10,11 +10,36 @@ use soroban_sdk::Address;
 
 #[test]
 fn non_creator_call_is_rejected() {
-    // Authenticated env so setup helpers succeed.
+    // Use the mock-auth env so setup helpers (set_protocol_admin, set_fee_config,
+    // register_creator, ...) succeed.
     let env = test_env_with_auths();
-    // Turn auth off again so the specific call below is *not* auto-authorized.
-    env.set_auth_enabled(false); // wait — see note below
 
     let (client, _id) = register_creator_keys(&env);
-    // ... rest of setup ...
+    set_pricing_and_fees(
+        &env,
+        &client,
+        100,
+        DEFAULT_CREATOR_BPS,
+        DEFAULT_PROTOCOL_BPS,
+    );
+
+    let creator = register_test_creator_with_fee_config(
+        &env,
+        &client,
+        "carolcreator",
+        DEFAULT_CREATOR_BPS,
+        DEFAULT_PROTOCOL_BPS,
+    );
+
+    let alice = Address::generate(&env);
+    let holders = [(alice.clone(), 1u32)];
+    setup_holders(&env, &client, &creator, &holders);
+
+    // Drop all mocked auths so creator.require_auth() inside
+    // distribute_dividend_claimable cannot be satisfied.
+    env.mock_auths(&[]);
+
+    let amounts = soroban_sdk::vec![&env, alice.clone()];
+    let result = client.try_distribute_dividend_claimable(&creator, &1_000i128, &amounts);
+    assert!(result.is_err());
 }
