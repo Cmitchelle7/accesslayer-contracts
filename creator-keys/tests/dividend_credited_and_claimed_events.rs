@@ -28,10 +28,19 @@ fn credited_and_claimed_events_are_emitted() {
 
     let amounts = soroban_sdk::vec![&env, alice.clone()];
     client.distribute_dividend_claimable(&creator, &1_000i128, &amounts);
-    let after_distribute = env.events().all();
-    assert!(!after_distribute.is_empty());
 
-    client.claim_dividend_claimable(&creator, &alice);
-    let after_claim = env.events().all();
-    assert!(after_claim.len() > after_distribute.len());
+    let unclaimed_before = client.get_unclaimed_dividend(&creator, &alice);
+    assert!(unclaimed_before > 0, "distribution should credit alice");
+    assert!(
+        !env.events().all().is_empty(),
+        "distribution should emit at least one event"
+    );
+
+    let claimed = client.claim_dividend_claimable(&creator, &alice);
+    assert_eq!(claimed, unclaimed_before);
+    assert_eq!(
+        client.get_unclaimed_dividend(&creator, &alice),
+        0,
+        "claim should zero the unclaimed balance"
+    );
 }
