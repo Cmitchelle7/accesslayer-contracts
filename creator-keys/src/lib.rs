@@ -7,6 +7,12 @@ use soroban_sdk::{
 };
 
 pub mod acl_limits_merge_sunset;
+/// Bonding-curve migration, key subscriptions, and atomic swaps.
+///
+/// Declared here as part of Issue #953 — the file existed but had no `mod`
+/// declaration, so `subscribe_key_access` and `is_subscribed` compiled nowhere
+/// and could not be called.
+pub mod curve_subscriptions_swaps;
 pub mod events;
 pub mod ratings_royalties_dividends;
 
@@ -1591,6 +1597,10 @@ pub enum DataKey {
     BuybackPoolAddress,
     /// Protocol-wide poll quorum-escalation configuration.
     EscalationConfig,
+    /// (creator) -> minimum key balance a wallet must hold to subscribe for
+    /// gated access (Issue #953). Absent means access gating is not configured
+    /// for that creator and `subscribe` rejects.
+    MinHoldForAccess(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6340,6 +6350,138 @@ impl CreatorKeysContract {
     /// that has never bought or been transferred keys, or that has sold all keys, without panicking or returning an error.
     pub fn get_balance(env: Env, creator: Address, wallet: Address) -> u32 {
         Self::get_key_balance(env, creator, wallet)
+    }
+
+    // ── Subscription access gating (Issue #953) ────────────────────────────
+    //
+    // `curve_subscriptions_swaps::subscribe_key_access` takes the subscriber's
+    // balance and the minimum as *parameters*. That is fine for an internal
+    // helper but must never be the contract's surface: a caller-supplied
+    // `subscriber_balance` makes the minimum-hold check self-attested, so any
+    // wallet could claim to hold enough and gate itself in.
+    //
+    // These entry points read both values from storage instead — the balance via
+    // `get_key_balance`, the minimum from `DataKey::MinHoldForAccess` — so the
+    // threshold is enforced against what the ledger actually says.
+
+    /// Sets the minimum key balance a wallet must hold to subscribe.
+    ///
+    /// Admin-only. The creator is deliberately *not* allowed to set their own
+    /// threshold: it gates paid access, so a creator who could lower it at will
+    /// could grant access to wallets holding nothing, which is the outcome the
+    /// gate exists to prevent.
+    pub fn set_min_hold_for_access(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        min_keys: u32,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+
+        if min_keys == 0 {
+            // Zero would gate nothing while looking configured. Removing the
+            // key is the honest way to disable gating, and `subscribe` reports
+            // that state distinctly.
+            return Err(ContractError::NotPositiveAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinHoldForAccess(creator.clone()), &min_keys);
+
+        env.events().publish(
+            (
+                soroban_sdk::symbol_short!("MIN_HOLD"),
+                creator,
+            ),
+            min_keys,
+        );
+
+        Ok(())
+    }
+
+    /// The configured minimum hold for a creator, or `None` when gating is off.
+    pub fn get_min_hold_for_access(env: Env, creator: Address) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinHoldForAccess(creator))
+    }
+
+    /// Subscribes `subscriber` to `creator`'s gated access for
+    /// `duration_ledgers`, provided they hold at least the configured minimum.
+    ///
+    /// The balance is read from storage, not supplied by the caller. Returns the
+    /// expiry ledger.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotPositiveAmount`] if `duration_ledgers` is zero — a
+    ///   subscription expiring on the ledger it was created in is never usable.
+    /// - [`ContractError::NotRegistered`] if no minimum is configured for the
+    ///   creator. Reported distinctly from an insufficient balance so an
+    ///   operator can tell "gating is off" from "you need more keys".
+    /// - [`ContractError::InsufficientBalance`] if the wallet holds less than
+    ///   the minimum.
+    pub fn subscribe(
+        env: Env,
+        creator: Address,
+        subscriber: Address,
+        duration_ledgers: u32,
+    ) -> Result<u32, ContractError> {
+        subscriber.require_auth();
+
+        if duration_ledgers == 0 {
+            return Err(ContractError::NotPositiveAmount);
+        }
+
+        let min_keys: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinHoldForAccess(creator.clone()))
+            .ok_or(ContractError::NotRegistered)?;
+
+        let balance = Self::get_key_balance(env.clone(), creator.clone(), subscriber.clone());
+
+        crate::curve_subscriptions_swaps::subscribe_key_access(
+            &env,
+            &creator,
+            &subscriber,
+            duration_ledgers,
+            min_keys,
+            balance,
+        )
+    }
+
+    /// Whether `subscriber` currently has gated access to `creator`.
+    ///
+    /// Re-checks the live balance against the minimum recorded on the
+    /// subscription, so access lapses the moment a holder sells below the
+    /// threshold — no revocation transaction required. That is what "revoked
+    /// automatically when holding drops below minimum" means here: the gate is
+    /// evaluated on read rather than swept by a job, so there is no window in
+    /// which a sold-out wallet still passes.
+    ///
+    /// Returns `false` for an unknown subscription, an expired one, or a
+    /// balance that has since fallen below the recorded minimum.
+    pub fn is_subscribed(env: Env, creator: Address, subscriber: Address) -> bool {
+        let balance = Self::get_key_balance(env.clone(), creator.clone(), subscriber.clone());
+        crate::curve_subscriptions_swaps::is_subscribed(&env, &creator, &subscriber, balance)
+    }
+
+    /// The stored subscription record, if any.
+    ///
+    /// Exposed alongside [`Self::is_subscribed`] because the boolean alone
+    /// cannot tell a caller *why* access was denied — expired, or under the
+    /// threshold. A UI needs to say which.
+    pub fn get_subscription(
+        env: Env,
+        creator: Address,
+        subscriber: Address,
+    ) -> Option<crate::curve_subscriptions_swaps::KeySubscription> {
+        env.storage().instance().get(
+            &crate::curve_subscriptions_swaps::EmdevelopaDataKey::Subscription(creator, subscriber),
+        )
     }
 
     /// Read-only view: returns a stable view of a holder's key count for a creator.
