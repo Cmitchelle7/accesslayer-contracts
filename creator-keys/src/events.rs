@@ -2801,6 +2801,44 @@ pub fn reputation_updated_topics(creator: &Address) -> (Symbol, Address) {
 }
 
 // ============================================================================
+// Feature: unique trader analytics
+// ============================================================================
+
+/// Event name emitted the first time a wallet trades a creator's keys.
+pub const UNIQUE_TRADER_ADDED_EVENT_NAME: Symbol = symbol_short!("uniq_trd");
+
+/// Stable unique-trader event payload.
+///
+/// Event shape:
+/// - topics: `(UNIQUE_TRADER_ADDED_EVENT_NAME, key_id, trader)`
+/// - data: `UniqueTraderAddedEvent`
+///
+/// Emitted exactly once per `(key_id, trader)` pair, on that wallet's first
+/// buy or sell. Repeat trades from the same wallet emit nothing, so an indexer
+/// can count these events directly instead of de-duplicating trade events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct UniqueTraderAddedEvent {
+    /// Creator whose keys were traded.
+    pub key_id: Address,
+    /// Wallet trading these keys for the first time.
+    pub trader: Address,
+    /// Unique trader count after this wallet was counted.
+    pub unique_trader_count: u64,
+    /// Ledger in which the first trade was recorded.
+    pub ledger: u32,
+}
+
+/// Shared unique-trader event topics tuple.
+pub fn unique_trader_added_topics(key_id: &Address, trader: &Address) -> (Symbol, Address, Address) {
+    (
+        UNIQUE_TRADER_ADDED_EVENT_NAME,
+        key_id.clone(),
+        trader.clone(),
+    )
+}
+
+// ============================================================================
 // Feature: key transfer allowances (approve / transfer_from)
 // ============================================================================
 
