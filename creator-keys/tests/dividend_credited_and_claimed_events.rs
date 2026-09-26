@@ -2,8 +2,8 @@
 
 mod contract_test_env;
 use contract_test_env::{
-    register_creator_keys, register_test_creator_with_fee_config, set_pricing_and_fees,
-    setup_holders, test_env_with_auths, DEFAULT_CREATOR_BPS, DEFAULT_PROTOCOL_BPS,
+    register_creator_keys, register_test_creator, set_pricing_and_fees, setup_holders,
+    test_env_with_auths, DEFAULT_CREATOR_BPS, DEFAULT_PROTOCOL_BPS,
 };
 use soroban_sdk::testutils::{Address as _, Events};
 use soroban_sdk::Address;
@@ -20,13 +20,7 @@ fn credited_and_claimed_events_are_emitted() {
         DEFAULT_PROTOCOL_BPS,
     );
 
-    let creator = register_test_creator_with_fee_config(
-        &env,
-        &client,
-        "davecreator",
-        DEFAULT_CREATOR_BPS,
-        DEFAULT_PROTOCOL_BPS,
-    );
+    let creator = register_test_creator(&env, &client, "davecreator");
 
     let alice = Address::generate(&env);
     let holders = [(alice.clone(), 1u32)];
