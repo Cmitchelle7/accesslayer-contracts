@@ -3365,3 +3365,26 @@ pub struct CurveResetEvent {
 pub fn curve_reset_topics(creator: &Address) -> (Symbol, Address) {
     (CURVE_RESET_EVENT_NAME, creator.clone())
 }
+
+// --- Key rating ---
+
+/// Event name for a key rating submission.
+pub const KEY_RATED_EVENT_NAME: Symbol = symbol_short!("key_rated");
+
+/// Event payload emitted when a key holder rates a creator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyRatedEvent {
+    pub creator: Address,
+    pub rater: Address,
+    pub score: u32,
+    pub total_score: u64,
+    pub count: u32,
+    pub average_score_scaled: u32,
+    pub ledger: u32,
+}
+
+/// Shared key rated event topics tuple.
+pub fn key_rated_topics(creator: &Address, rater: &Address) -> (Symbol, Address, Address) {
+    (KEY_RATED_EVENT_NAME, creator.clone(), rater.clone())
+}
