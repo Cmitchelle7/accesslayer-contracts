@@ -2,9 +2,7 @@
 //! Minimal factory that deploys `creator-keys` contract instances and keeps a
 //! registry of the deployed addresses.
 
-use creator_keys::{
-    CreatorKeysContractClient, CurvePreset, RegisterCreatorParams,
-};
+use creator_keys::{CreatorKeysContractClient, CurvePreset, RegisterCreatorParams};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
@@ -228,14 +226,16 @@ impl CreatorKeysFactory {
         env.storage().instance().set(&DataKey::Registry, &registry);
         let mut creator_keys = Self::get_keys_by_creator(env.clone(), config.creator.clone());
         creator_keys.push_back(key.clone());
-        env.storage().instance().set(
-            &DataKey::CreatorKeys(config.creator.clone()),
-            &creator_keys,
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::CreatorKeys(config.creator.clone()), &creator_keys);
         write_registry_count(&env, registry.len());
         env.events().publish(
             (KEY_DEPLOYED_EVENT_NAME, config.creator.clone()),
-            KeyDeployedEvent { key: key.clone(), creator: config.creator },
+            KeyDeployedEvent {
+                key: key.clone(),
+                creator: config.creator,
+            },
         );
         Ok(key)
     }
