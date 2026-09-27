@@ -7,8 +7,12 @@
 //! [`PLATFORM_RESUME_DELAY_SECS`] (24h) has elapsed. A per-key override lets
 //! the same admins halt a single key independently of the platform state.
 
+use crate::events::{
+    self, KeyPauseOverrideEvent, PlatformPausedEvent, PlatformResumeQueuedEvent,
+    PlatformResumedEvent,
+};
 use crate::{read_global_pause_admins, ContractError, GLOBAL_PAUSE_THRESHOLD};
-use soroban_sdk::{contracterror, contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contracterror, contracttype, Address, Env, Vec};
 
 /// Timelock delay between queueing and executing a platform resume (24 hours).
 pub const PLATFORM_RESUME_DELAY_SECS: u64 = 86_400;
@@ -50,40 +54,6 @@ pub enum EmergencyPauseDataKey {
     ResumeEta,
     /// Per-key emergency pause override.
     KeyPaused(Address),
-}
-
-pub const PLATFORM_PAUSED_EVENT: Symbol = symbol_short!("plat_pau");
-pub const PLATFORM_RESUME_QUEUED_EVENT: Symbol = symbol_short!("plat_rq");
-pub const PLATFORM_RESUMED_EVENT: Symbol = symbol_short!("plat_res");
-pub const KEY_PAUSE_OVERRIDE_EVENT: Symbol = symbol_short!("key_pau");
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct PlatformPausedEvent {
-    pub actor: Address,
-    pub timestamp: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct PlatformResumeQueuedEvent {
-    pub actor: Address,
-    pub executable_at: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct PlatformResumedEvent {
-    pub actor: Address,
-    pub timestamp: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct KeyPauseOverrideEvent {
-    pub key_id: Address,
-    pub paused: bool,
-    pub actor: Address,
 }
 
 /// Validates that `signers` are distinct members of the global-pause admin set,
@@ -155,7 +125,7 @@ pub fn pause_platform(env: &Env, signers: &Vec<Address>) -> Result<(), Emergency
     storage.remove(&EmergencyPauseDataKey::ResumeEta);
 
     env.events().publish(
-        (PLATFORM_PAUSED_EVENT, actor.clone()),
+        events::platform_paused_topics(&actor),
         PlatformPausedEvent {
             actor,
             timestamp: env.ledger().timestamp(),
@@ -188,7 +158,7 @@ pub fn queue_platform_resume(
         .set(&EmergencyPauseDataKey::ResumeEta, &executable_at);
 
     env.events().publish(
-        (PLATFORM_RESUME_QUEUED_EVENT, actor.clone()),
+        events::platform_resume_queued_topics(&actor),
         PlatformResumeQueuedEvent {
             actor,
             executable_at,
@@ -214,7 +184,7 @@ pub fn resume_platform(env: &Env, signers: &Vec<Address>) -> Result<(), Emergenc
     storage.remove(&EmergencyPauseDataKey::ResumeEta);
 
     env.events().publish(
-        (PLATFORM_RESUMED_EVENT, actor.clone()),
+        events::platform_resumed_topics(&actor),
         PlatformResumedEvent {
             actor,
             timestamp: now,
@@ -241,7 +211,7 @@ pub fn set_key_pause_override(
     }
 
     env.events().publish(
-        (KEY_PAUSE_OVERRIDE_EVENT, key_id.clone()),
+        events::key_pause_override_topics(key_id),
         KeyPauseOverrideEvent {
             key_id: key_id.clone(),
             paused,

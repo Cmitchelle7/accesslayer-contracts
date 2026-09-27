@@ -1,9 +1,7 @@
 //! Tests for issue #1000 (emergency pause for a platform-wide trading halt).
 
-use crate::emergency_pause::{
-    self, EmergencyPauseError, PlatformPausedEvent, PlatformResumedEvent,
-    PLATFORM_RESUME_DELAY_SECS,
-};
+use crate::emergency_pause::{EmergencyPauseError, PLATFORM_RESUME_DELAY_SECS};
+use crate::events::{self, PlatformPausedEvent, PlatformResumedEvent};
 use crate::{ContractError, CreatorKeysContract, CreatorKeysContractClient, RegisterCreatorParams};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
@@ -222,7 +220,7 @@ fn pause_platform_emits_event_with_timestamp_and_actor() {
     let (_contract, topics, data) = events.last().unwrap();
     let name: Symbol = topics.get(0).unwrap().try_into_val(&s.env).unwrap();
     let topic_actor: Address = topics.get(1).unwrap().try_into_val(&s.env).unwrap();
-    assert_eq!(name, emergency_pause::PLATFORM_PAUSED_EVENT);
+    assert_eq!(name, events::PLATFORM_PAUSED_EVENT_NAME);
     assert_eq!(topic_actor, signers.get_unchecked(0));
 
     let payload: PlatformPausedEvent = data.try_into_val(&s.env).unwrap();
@@ -280,7 +278,7 @@ fn resume_platform_emits_event_with_timestamp_and_actor() {
     let events = s.env.events().all();
     let (_contract, topics, data) = events.last().unwrap();
     let name: Symbol = topics.get(0).unwrap().try_into_val(&s.env).unwrap();
-    assert_eq!(name, emergency_pause::PLATFORM_RESUMED_EVENT);
+    assert_eq!(name, events::PLATFORM_RESUMED_EVENT_NAME);
     let payload: PlatformResumedEvent = data.try_into_val(&s.env).unwrap();
     assert_eq!(
         payload,
