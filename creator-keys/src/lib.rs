@@ -1092,6 +1092,19 @@ pub struct QuoteResponse {
     pub total_amount: i128,
 }
 
+/// Supply snapshot for a key, returned by [`CreatorKeysContract::get_supply_info`]
+/// (issue #997).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SupplyInfo {
+    /// Current number of keys in circulation.
+    pub supply: u32,
+    /// Hard supply cap configured at deployment, or `0` when uncapped.
+    pub cap: u32,
+    /// Keys that can still be minted: `cap - supply`, or `u32::MAX` when uncapped.
+    pub remaining: u32,
+}
+
 /// Shared result type for read-only quote methods.
 pub type QuoteViewResult = Result<QuoteResponse, ContractError>;
 
@@ -4699,17 +4712,18 @@ impl CreatorKeysContract {
             );
         }
 
-        // Handle max supply cap
+        // Handle max supply cap (issue #997): a cap of `0` is normalized to
+        // "unlimited" — the key grows without limit, the cap entry stays
+        // unwritten, and `get_supply_info` reports `cap = 0`.
         if let Some(cap) = max_supply {
-            if cap == 0 {
-                return Err(ContractError::NotPositiveAmount);
+            if cap > 0 {
+                if supply > cap {
+                    return Err(ContractError::SupplyCapExceeded);
+                }
+                env.storage()
+                    .persistent()
+                    .set(&constants::storage::max_supply(&creator), &cap);
             }
-            if supply > cap {
-                return Err(ContractError::SupplyCapExceeded);
-            }
-            env.storage()
-                .persistent()
-                .set(&constants::storage::max_supply(&creator), &cap);
         }
 
         // Handle max keys per wallet cap
@@ -5069,6 +5083,26 @@ impl CreatorKeysContract {
                 .persistent()
                 .set(&last_buy_key, &env.ledger().timestamp());
             extend_key_ttl_to_full_window(&env, &last_buy_key);
+
+            // SupplyCapReached (#997): fire exactly once, on the key that fills
+            // the configured cap (a partial fill that reaches the cap emits it).
+            if let Some(cap) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&constants::storage::max_supply(&creator))
+            {
+                if profile.supply == cap {
+                    env.events().publish(
+                        events::supply_cap_reached_topics(&creator),
+                        events::SupplyCapReachedEvent {
+                            creator_id: creator.clone(),
+                            new_supply: profile.supply,
+                            cap,
+                            ledger: env.ledger().sequence(),
+                        },
+                    );
+                }
+            }
 
             total_price = total_price
                 .checked_add(key_price)
@@ -5459,6 +5493,26 @@ impl CreatorKeysContract {
         // Grant the balance entry the full TTL window so long-held positions
         // survive the same horizon as creator state between trades.
         extend_key_ttl_to_full_window(&env, &balance_key);
+
+        // SupplyCapReached (#997): fire exactly once, on the trade that fills
+        // the configured cap. Uncapped keys (cap 0) never emit it.
+        if let Some(cap) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&constants::storage::max_supply(&creator))
+        {
+            if profile.supply == cap {
+                env.events().publish(
+                    events::supply_cap_reached_topics(&creator),
+                    events::SupplyCapReachedEvent {
+                        creator_id: creator.clone(),
+                        new_supply: profile.supply,
+                        cap,
+                        ledger: env.ledger().sequence(),
+                    },
+                );
+            }
+        }
 
         // Flash-loan guard (issue #781): record this buy's ledger so sell_key can
         // reject a same-ledger sell of the position just bought.
@@ -7465,13 +7519,18 @@ impl CreatorKeysContract {
     }
 
     /// Registers a creator key on their behalf with its full initial config:
-    /// zero supply, curve preset, buy cooldown, metadata and an optional
-    /// `auction_pending` flag. Emits [`events::KeyRegisteredEvent`].
+    /// zero supply, curve preset, buy cooldown, optional supply cap, metadata
+    /// and an optional `auction_pending` flag. Emits [`events::KeyRegisteredEvent`].
     ///
     /// The issue text names an authorised factory contract, but this
     /// repository has none, so the caller is gated on the protocol admin.
     /// `auction_mode` only records the `auction_pending` flag; the auction
     /// price and supply are still set by the creator via `configure_auction`.
+    ///
+    /// `supply_cap` sets the hard supply cap enforced by the buy entrypoints
+    /// (issue #997). `0` means the key is uncapped: buys may grow supply without
+    /// limit, `get_supply_info` reports a cap of `0`, and no cap storage is
+    /// written.
     ///
     /// # Errors
     /// - [`ContractError::Unauthorized`] if `admin` is not the protocol admin.
@@ -7489,6 +7548,7 @@ impl CreatorKeysContract {
         metadata: KeyMetadata,
         curve_preset: CurvePreset,
         cooldown_ledgers: u32,
+        supply_cap: u32,
         auction_mode: bool,
     ) -> Result<(), ContractError> {
         admin.require_auth();
@@ -7527,6 +7587,14 @@ impl CreatorKeysContract {
             .persistent()
             .set(&cooldown_key, &cooldown_ledgers);
         extend_key_ttl_to_full_window(&env, &cooldown_key);
+
+        // Optional hard supply cap (issue #997). `0` means unlimited, so the
+        // cap entry is left unwritten for uncapped keys.
+        if supply_cap > 0 {
+            let supply_cap_key = constants::storage::max_supply(&creator);
+            env.storage().persistent().set(&supply_cap_key, &supply_cap);
+            extend_key_ttl_to_full_window(&env, &supply_cap_key);
+        }
 
         let auction_key = constants::storage::auction_pending(&creator);
         env.storage().persistent().set(&auction_key, &auction_mode);
@@ -13834,6 +13902,36 @@ impl CreatorKeysContract {
     pub fn get_supply(env: Env, creator: Address) -> Result<u32, ContractError> {
         let profile = read_registered_creator_profile(&env, &creator)?;
         Ok(profile.supply)
+    }
+
+    /// Read-only view (#997): returns the current supply, the configured hard
+    /// supply cap, and the remaining mintable supply for a key.
+    ///
+    /// A cap of `0` means the key is uncapped: `remaining` is `u32::MAX` and
+    /// the buy entrypoints never enforce a ceiling.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotRegistered`] if the creator is not registered.
+    pub fn get_supply_info(
+        env: Env,
+        key_id: Address,
+    ) -> Result<SupplyInfo, ContractError> {
+        let profile = read_registered_creator_profile(&env, &key_id)?;
+        let cap_key = constants::storage::max_supply(&key_id);
+        let cap: u32 = env.storage().persistent().get(&cap_key).unwrap_or(0);
+        if cap > 0 {
+            bump_persistent_ttl(&env, &cap_key);
+        }
+        let remaining = if cap == 0 {
+            u32::MAX
+        } else {
+            cap.saturating_sub(profile.supply)
+        };
+        Ok(SupplyInfo {
+            supply: profile.supply,
+            cap,
+            remaining,
+        })
     }
 
     /// Read-only view: returns the current buy and sell price for a creator's key,

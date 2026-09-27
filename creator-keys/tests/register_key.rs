@@ -1,6 +1,7 @@
 //! Tests for admin-authorised `register_key`: standard and auction-mode
-//! registration, stored configuration, the `KeyRegistered` event, and
-//! rejection of unauthorised callers.
+//! registration, stored configuration (including the optional supply cap,
+//! issue #997), the `KeyRegistered` event, and rejection of unauthorised
+//! callers.
 
 mod contract_test_env;
 
@@ -51,6 +52,7 @@ fn test_standard_registration_initialises_key_config() {
         &metadata(&env),
         &CurvePreset::Quadratic,
         &12,
+        &0,
         &false,
     );
     // `env.events()` only holds the last invocation's events.
@@ -84,6 +86,7 @@ fn test_auction_mode_registration_sets_auction_pending() {
         &metadata(&env),
         &CurvePreset::Linear,
         &0,
+        &0,
         &true,
     );
     // `env.events()` only holds the last invocation's events.
@@ -109,6 +112,7 @@ fn test_non_admin_caller_is_rejected() {
         &metadata(&env),
         &CurvePreset::Linear,
         &0,
+        &0,
         &false,
     );
     assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
@@ -128,6 +132,7 @@ fn test_duplicate_registration_is_rejected() {
         &metadata(&env),
         &CurvePreset::Linear,
         &0,
+        &0,
         &false,
     );
     let result = client.try_register_key(
@@ -136,6 +141,7 @@ fn test_duplicate_registration_is_rejected() {
         &String::from_str(&env, "alice"),
         &metadata(&env),
         &CurvePreset::Linear,
+        &0,
         &0,
         &false,
     );
