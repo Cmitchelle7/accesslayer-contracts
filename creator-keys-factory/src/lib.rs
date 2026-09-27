@@ -171,7 +171,7 @@ impl CreatorKeysFactory {
         if caller != config.creator {
             return Err(FactoryError::Unauthorized);
         }
-        if config.handle.len() == 0 || config.handle.len() > 64 {
+        if config.handle.is_empty() || config.handle.len() > 64 {
             return Err(FactoryError::InvalidConfig);
         }
         if config.max_supply == Some(0) || config.max_keys_per_wallet == Some(0) {
