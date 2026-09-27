@@ -10569,7 +10569,6 @@ impl CreatorKeysContract {
         stake_id: u32,
     ) -> Result<StakeExit, StakingError> {
         holder.require_auth();
-        ... (rest of early_unstake_position's body, unchanged) ...
     }
         let pool_key = constants::storage::staking_rewards_pool(&creator);
         let mut state: StakingRewardsState =
