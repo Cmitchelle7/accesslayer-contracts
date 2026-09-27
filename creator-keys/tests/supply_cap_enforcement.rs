@@ -152,9 +152,10 @@ fn test_partial_fill_exactly_reaching_cap_succeeds() {
     }
 
     // A batch buy of exactly 2 fills the key to its cap and must succeed.
+    // `buy_keys` returns the resulting total supply, not the quantity filled.
     let quote = client.get_buy_quote(&creator);
-    let bought = client.buy_keys(&creator, &buyer, &2, &(quote.total_amount * 10), &None);
-    assert_eq!(bought, 2);
+    let new_supply = client.buy_keys(&creator, &buyer, &2, &(quote.total_amount * 10), &None);
+    assert_eq!(new_supply, 10);
     assert_eq!(client.get_supply(&creator), 10);
 
     let info = client.get_supply_info(&creator);
