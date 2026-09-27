@@ -7608,8 +7608,8 @@ impl CreatorKeysContract {
         image_cid: String,
     ) -> Result<(), ContractError> {
         key_id.require_auth();
-        let mut metadata = read_creator_metadata(&env, &key_id)
-            .ok_or(ContractError::NotRegistered)?;
+        let mut metadata =
+            read_creator_metadata(&env, &key_id).ok_or(ContractError::NotRegistered)?;
 
         assert_metadata_field_length(
             &description,

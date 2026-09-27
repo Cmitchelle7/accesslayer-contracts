@@ -181,7 +181,10 @@ fn update_metadata_emits_event_on_change() {
     let stored = client.get_key_metadata(&creator).unwrap();
     assert_eq!(stored.name, String::from_str(&env, "MyKey"));
     assert_eq!(stored.symbol, String::from_str(&env, "MYKEY"));
-    assert_eq!(stored.description, String::from_str(&env, "New description"));
+    assert_eq!(
+        stored.description,
+        String::from_str(&env, "New description")
+    );
     assert_eq!(stored.image_cid, String::from_str(&env, "bafy-new-image"));
 }
 

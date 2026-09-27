@@ -1,12 +1,14 @@
 #![cfg(test)]
 
 use crate::{
+    events::{MetadataUpdatedEvent, METADATA_UPDATED_EVENT_NAME},
     ContractError, CreatorKeysContract, CreatorKeysContractClient, KeyMetadata,
-    RegisterCreatorParams, events::{MetadataUpdatedEvent, METADATA_UPDATED_EVENT_NAME},
-    METADATA_DESCRIPTION_MAX_LEN, METADATA_IMAGE_CID_MAX_LEN, METADATA_NAME_MAX_LEN,
+    RegisterCreatorParams, METADATA_DESCRIPTION_MAX_LEN, METADATA_IMAGE_CID_MAX_LEN,
+    METADATA_NAME_MAX_LEN,
 };
 use soroban_sdk::{
-    testutils::{Address as _, Events}, Address, Env, IntoVal, String, Symbol,
+    testutils::{Address as _, Events},
+    Address, Env, IntoVal, String, Symbol,
 };
 
 fn setup_test() -> (Env, CreatorKeysContractClient<'static>, Address, Address) {
@@ -311,19 +313,25 @@ fn test_update_metadata_updates_only_mutable_fields_and_emits_changed_values() {
         &String::from_str(&env, "bafy-old-image"),
     );
 
-    let stored = client.get_metadata(&creator).unwrap();
-    assert_eq!(stored.name, initial.name);
-    assert_eq!(stored.symbol, initial.symbol);
-    assert_eq!(stored.description, String::from_str(&env, "New description"));
-    assert_eq!(stored.image_cid, String::from_str(&env, "bafy-new-image"));
-
     let (_, topics, data) = env.events().all().last().unwrap();
     let event_name: Symbol = topics.get(0).unwrap().into_val(&env);
     assert_eq!(event_name, METADATA_UPDATED_EVENT_NAME);
     let event: MetadataUpdatedEvent = data.into_val(&env);
     assert_eq!(event.creator_id, creator);
-    assert_eq!(event.description, Some(String::from_str(&env, "New description")));
+    assert_eq!(
+        event.description,
+        Some(String::from_str(&env, "New description"))
+    );
     assert_eq!(event.image_cid, None);
+
+    let stored = client.get_metadata(&creator).unwrap();
+    assert_eq!(stored.name, initial.name);
+    assert_eq!(stored.symbol, initial.symbol);
+    assert_eq!(
+        stored.description,
+        String::from_str(&env, "New description")
+    );
+    assert_eq!(stored.image_cid, String::from_str(&env, "bafy-old-image"));
 
     client.update_metadata(
         &creator,
@@ -333,12 +341,18 @@ fn test_update_metadata_updates_only_mutable_fields_and_emits_changed_values() {
     let (_, _, data) = env.events().all().last().unwrap();
     let event: MetadataUpdatedEvent = data.into_val(&env);
     assert_eq!(event.description, None);
-    assert_eq!(event.image_cid, Some(String::from_str(&env, "bafy-new-image")));
+    assert_eq!(
+        event.image_cid,
+        Some(String::from_str(&env, "bafy-new-image"))
+    );
 
     let stored = client.get_metadata(&creator).unwrap();
     assert_eq!(stored.name, initial.name);
     assert_eq!(stored.symbol, initial.symbol);
-    assert_eq!(stored.description, String::from_str(&env, "New description"));
+    assert_eq!(
+        stored.description,
+        String::from_str(&env, "New description")
+    );
     assert_eq!(stored.image_cid, String::from_str(&env, "bafy-new-image"));
 }
 
