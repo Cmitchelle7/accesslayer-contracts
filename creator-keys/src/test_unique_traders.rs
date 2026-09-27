@@ -6,7 +6,7 @@
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Events, Ledger};
-use soroban_sdk::{Address, Env, IntoVal, String};
+use soroban_sdk::{Address, Env, String, Symbol, TryIntoVal};
 
 /// Register a contract with an admin and a flat curve, as `test.rs` does.
 /// Duplicated rather than imported: `test.rs`'s helpers are private to that
@@ -38,7 +38,15 @@ fn setup_env_with_creator<'a>(env: &'a Env) -> (CreatorKeysContractClient<'a>, A
     (client, admin, creator)
 }
 
-/// Count the `uniq_trd` events published so far.
+/// Count the `uniq_trd` events published by the most recent contract call.
+///
+/// `env.events().all()` holds only the latest invocation's events, so this
+/// answers "did the call I just made emit one?" rather than giving a running
+/// total. Assert with it immediately after the call under test.
+///
+/// Topics come back as raw `Val`, which has no `PartialEq`, so the first topic
+/// is converted to a `Symbol` before comparing. A topic that is not a symbol
+/// belongs to some other event and simply does not match.
 fn unique_trader_events(env: &Env) -> u32 {
     env.events()
         .all()
@@ -46,8 +54,11 @@ fn unique_trader_events(env: &Env) -> u32 {
         .filter(|(_, topics, _)| {
             topics
                 .get(0)
-                .map(|t| t == events::UNIQUE_TRADER_ADDED_EVENT_NAME.into_val(env))
-                .unwrap_or(false)
+                .and_then(|topic| {
+                    let name: Result<Symbol, _> = topic.try_into_val(env);
+                    name.ok()
+                })
+                .is_some_and(|name| name == events::UNIQUE_TRADER_ADDED_EVENT_NAME)
         })
         .count() as u32
 }
@@ -153,16 +164,26 @@ fn test_unique_trader_event_emitted_once_per_wallet() {
     let (client, _admin, creator) = setup_env_with_creator(&env);
     let buyer = Address::generate(&env);
 
-    let before = unique_trader_events(&env);
     client.buy_key(&creator, &buyer, &1000i128, &None);
-    assert_eq!(unique_trader_events(&env), before + 1);
+    assert_eq!(
+        unique_trader_events(&env),
+        1,
+        "first buy from a wallet must emit the event"
+    );
 
     // Neither a repeat buy nor a sell from the same wallet re-emits.
     client.buy_key(&creator, &buyer, &2000i128, &None);
+    assert_eq!(
+        unique_trader_events(&env),
+        0,
+        "a repeat buy must not re-emit"
+    );
+
     next_ledger(&env);
     client.sell_key(&creator, &buyer, &None);
+    assert_eq!(unique_trader_events(&env), 0, "a sell must not re-emit");
 
-    assert_eq!(unique_trader_events(&env), before + 1);
+    assert_eq!(client.get_unique_trader_count(&creator), 1u64);
 }
 
 #[test]
@@ -173,12 +194,16 @@ fn test_unique_trader_event_emitted_for_each_new_wallet() {
     let b2 = Address::generate(&env);
     let b3 = Address::generate(&env);
 
-    let before = unique_trader_events(&env);
+    // Checked per call: the helper only sees the latest invocation's events.
     client.buy_key(&creator, &b1, &1000i128, &None);
-    client.buy_key(&creator, &b2, &2000i128, &None);
-    client.buy_key(&creator, &b3, &3000i128, &None);
+    assert_eq!(unique_trader_events(&env), 1);
 
-    assert_eq!(unique_trader_events(&env), before + 3);
+    client.buy_key(&creator, &b2, &2000i128, &None);
+    assert_eq!(unique_trader_events(&env), 1);
+
+    client.buy_key(&creator, &b3, &3000i128, &None);
+    assert_eq!(unique_trader_events(&env), 1);
+
     assert_eq!(client.get_unique_trader_count(&creator), 3u64);
 }
 
@@ -188,19 +213,23 @@ fn test_unique_trader_count_after_bulk_trades() {
     let (client, _admin, creator) = setup_env_with_creator(&env);
 
     // Ten wallets, each trading twice — the count must track wallets, not trades.
-    let wallets: std::vec::Vec<Address> = (0..10).map(|_| Address::generate(&env)).collect();
-
-    for wallet in &wallets {
-        client.buy_key(&creator, wallet, &10_000i128, &None);
+    // The crate is no_std, so this is a soroban Vec rather than a std one.
+    let mut wallets = soroban_sdk::Vec::new(&env);
+    for _ in 0..10 {
+        wallets.push_back(Address::generate(&env));
     }
-    for wallet in &wallets {
-        client.buy_key(&creator, wallet, &10_000i128, &None);
+
+    for wallet in wallets.iter() {
+        client.buy_key(&creator, &wallet, &10_000i128, &None);
+    }
+    for wallet in wallets.iter() {
+        client.buy_key(&creator, &wallet, &10_000i128, &None);
     }
 
     assert_eq!(client.get_unique_trader_count(&creator), 10u64);
     assert_eq!(client.get_analytics(&creator).trade_count, 20u64);
 
-    for wallet in &wallets {
-        assert!(client.has_traded(&creator, wallet));
+    for wallet in wallets.iter() {
+        assert!(client.has_traded(&creator, &wallet));
     }
 }
