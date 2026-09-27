@@ -1788,6 +1788,31 @@ pub enum StakingKey {
     NextStakeId(Address, Address),
 }
 
+/// Storage keys for key ratings, bundle offerings, performance bonds and atomic
+/// swaps.
+///
+/// Kept separate from [`DataKey`] to stay within Soroban's 50-variant
+/// `#[contracttype]` cap.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum FeatureKey {
+    // --- Key ratings ---
+    /// (creator) -> aggregate `KeyRatingAggregate` struct.
+    KeyRatingAggregate(Address),
+    /// (creator, rater) -> individual score submitted by `rater` -> `u32`.
+    HolderKeyRating(Address, Address),
+    // --- Bundle offerings ---
+    /// (bundle_id) -> `KeyBundle` struct.
+    KeyBundle(u64),
+    /// Next sequential bundle id -> `u64`.
+    NextBundleId,
+    // --- Performance bonds ---
+    /// (creator) -> locked performance bond amount in stroops -> `i128`.
+    PerformanceBond(Address),
+    /// Protocol-wide minimum performance bond amount configured by admin -> `i128`.
+    MinPerformanceBond,
+}
+
 /// Storage keys for the cycle-based protocol revenue distribution (#877).
 ///
 /// Kept separate from [`DataKey`] to stay within Soroban's 50-variant cap.
@@ -4827,8 +4852,124 @@ fn is_escalation_eligible(
     (participation_bps as u128) >= required_bps
 }
 
+// ============================================================================
+// Feature structs: key ratings, bundle offerings, performance bonds, atomic swaps
+// ============================================================================
+
+/// Aggregated rating summary for a creator key.
+///
+/// `total_score` is the sum of all individual scores, `count` is the number of
+/// unique raters, and `average_score_scaled` is `(total_score * 100) / count`
+/// (e.g. 450 == 4.50 stars).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyRatingAggregate {
+    pub total_score: u64,
+    pub count: u32,
+    /// Running average × 100 (e.g. 450 == 4.50 stars).
+    pub average_score_scaled: u32,
+}
+
+/// Errors raised by [`CreatorKeysContract::rate_key`].
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RatingError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The score is outside the accepted range (1–5).
+    InvalidScore = 2,
+    /// The rater holds zero keys for this creator.
+    NotAHolder = 3,
+}
+
+/// A single entry inside a key bundle (key ID + quantity).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct BundleEntry {
+    pub key_id: Address,
+    pub quantity: u32,
+}
+
+/// A creator-defined bundle of multiple keys sold at a discounted combined price.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyBundle {
+    pub bundle_id: u64,
+    pub creator: Address,
+    pub entries: Vec<BundleEntry>,
+    /// Discounted total price in stroops; must be ≥ `min_price_floor`.
+    pub discounted_price: i128,
+    /// Ledger at which the bundle expires (inclusive).
+    pub expires_at_ledger: u32,
+}
+
+/// Errors raised by bundle entrypoints.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum BundleError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The discounted price is below the minimum price floor.
+    BelowPriceFloor = 2,
+    /// The bundle has expired.
+    BundleExpired = 3,
+    /// The bundle was not found.
+    BundleNotFound = 4,
+    /// The bundle entry list is empty.
+    EmptyBundle = 5,
+    /// The buyer has insufficient balance.
+    InsufficientBalance = 6,
+    /// Arithmetic overflow.
+    Overflow = 7,
+    /// The caller is not the bundle creator.
+    Unauthorized = 8,
+    /// The protocol is paused.
+    ProtocolPaused = 9,
+}
+
+/// Errors raised by performance bond entrypoints.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum BondError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The bond amount is below the configured minimum.
+    BelowMinimumBond = 2,
+    /// No bond has been staked for this creator.
+    BondNotFound = 3,
+    /// The caller is not the protocol admin.
+    Unauthorized = 4,
+    /// Arithmetic overflow.
+    Overflow = 5,
+    /// The bond amount is not positive.
+    NotPositiveAmount = 6,
+}
+
+/// Errors raised by [`CreatorKeysContract::atomic_swap`].
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SwapError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// One side has insufficient liquid balance.
+    InsufficientBalance = 2,
+    /// One wallet's position is frozen.
+    FrozenPosition = 3,
+    /// Arithmetic overflow in fee calculation.
+    Overflow = 4,
+    /// The protocol is paused.
+    ProtocolPaused = 5,
+    /// Swap amount is zero.
+    ZeroAmount = 6,
+}
+
 #[contract]
 pub struct CreatorKeysContract;
+
 
 #[contractimpl]
 impl CreatorKeysContract {
@@ -5010,6 +5151,102 @@ impl CreatorKeysContract {
         );
 
         Ok(())
+    }
+
+    /// Rates a creator key (score 1-5). Requires non-zero key holding balance.
+    /// Emits `KeyRated` event and maintains incremental running average.
+    pub fn rate_key(
+        env: Env,
+        creator: Address,
+        rater: Address,
+        score: u32,
+    ) -> Result<KeyRatingAggregate, RatingError> {
+        rater.require_auth();
+
+        if score < 1 || score > 5 {
+            return Err(RatingError::InvalidScore);
+        }
+
+        let creator_key = constants::storage::creator(&creator);
+        if !env.storage().persistent().has(&creator_key) {
+            return Err(RatingError::NotRegistered);
+        }
+
+        let holder_bal = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&constants::storage::holder_balance_key(&creator, &rater))
+            .unwrap_or(0);
+        if holder_bal == 0 {
+            return Err(RatingError::NotAHolder);
+        }
+
+        let agg_key = FeatureKey::KeyRatingAggregate(creator.clone());
+        let mut agg = env
+            .storage()
+            .persistent()
+            .get::<_, KeyRatingAggregate>(&agg_key)
+            .unwrap_or(KeyRatingAggregate {
+                total_score: 0,
+                count: 0,
+                average_score_scaled: 0,
+            });
+
+        let rater_key = FeatureKey::HolderKeyRating(creator.clone(), rater.clone());
+        if let Some(prev_score) = env.storage().persistent().get::<_, u32>(&rater_key) {
+            agg.total_score = agg
+                .total_score
+                .checked_sub(prev_score as u64)
+                .ok_or(RatingError::NotRegistered)?
+                .checked_add(score as u64)
+                .ok_or(RatingError::NotRegistered)?;
+        } else {
+            agg.count = agg.count.checked_add(1).ok_or(RatingError::NotRegistered)?;
+            agg.total_score = agg
+                .total_score
+                .checked_add(score as u64)
+                .ok_or(RatingError::NotRegistered)?;
+        }
+
+        agg.average_score_scaled = if agg.count > 0 {
+            ((agg.total_score as u128 * 100) / (agg.count as u128)) as u32
+        } else {
+            0
+        };
+
+        env.storage().persistent().set(&rater_key, &score);
+        extend_key_ttl_to_full_window(&env, &rater_key);
+
+        env.storage().persistent().set(&agg_key, &agg);
+        extend_key_ttl_to_full_window(&env, &agg_key);
+
+        env.events().publish(
+            events::key_rated_topics(&creator, &rater),
+            events::KeyRatedEvent {
+                creator: creator.clone(),
+                rater: rater.clone(),
+                score,
+                total_score: agg.total_score,
+                count: agg.count,
+                average_score_scaled: agg.average_score_scaled,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(agg)
+    }
+
+    /// Gets the current rating aggregate for a creator key.
+    pub fn get_key_rating(env: Env, creator: Address) -> KeyRatingAggregate {
+        let agg_key = FeatureKey::KeyRatingAggregate(creator);
+        env.storage()
+            .persistent()
+            .get::<_, KeyRatingAggregate>(&agg_key)
+            .unwrap_or(KeyRatingAggregate {
+                total_score: 0,
+                count: 0,
+                average_score_scaled: 0,
+            })
     }
 
     pub fn buy_key(
