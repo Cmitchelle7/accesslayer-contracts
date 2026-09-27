@@ -6885,13 +6885,8 @@ impl CreatorKeysContract {
             .persistent()
             .set(&DataKey::MinHoldForAccess(creator.clone()), &min_keys);
 
-        env.events().publish(
-            (
-                soroban_sdk::symbol_short!("MIN_HOLD"),
-                creator,
-            ),
-            min_keys,
-        );
+        env.events()
+            .publish((soroban_sdk::symbol_short!("MIN_HOLD"), creator), min_keys);
 
         Ok(())
     }

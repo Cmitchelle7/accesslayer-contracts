@@ -7,11 +7,9 @@
 
 mod contract_test_env;
 
-use contract_test_env::{
-    register_creator_keys, register_test_creator, test_env_with_auths,
-};
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
+use contract_test_env::{register_creator_keys, register_test_creator, test_env_with_auths};
 use soroban_sdk::testutils::Ledger;
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
 
 const MIN_HOLD: u32 = 3;
 const DURATION: u32 = 1_000;
@@ -38,7 +36,12 @@ fn setup() -> (
     (env.clone(), client, admin, creator)
 }
 
-fn buy(client: &contract_test_env::CreatorKeysContractClient<'_>, creator: &Address, wallet: &Address, count: u32) {
+fn buy(
+    client: &contract_test_env::CreatorKeysContractClient<'_>,
+    creator: &Address,
+    wallet: &Address,
+    count: u32,
+) {
     for _ in 0..count {
         client.buy_key(creator, wallet, &KEY_PRICE, &None);
     }
@@ -99,7 +102,10 @@ fn subscribe_accepts_a_qualifying_hold_and_returns_the_expiry() {
     assert_eq!(expiry, before + DURATION);
     assert!(client.is_subscribed(&creator, &wallet));
     assert_eq!(
-        client.get_subscription(&creator, &wallet).unwrap().expires_at_ledger,
+        client
+            .get_subscription(&creator, &wallet)
+            .unwrap()
+            .expires_at_ledger,
         expiry
     );
 }
