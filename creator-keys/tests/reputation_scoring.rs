@@ -120,7 +120,6 @@ fn test_key_launch_increments_reputation() {
         &metadata(&env),
         &CurvePreset::Linear,
         &0,
-        &0,
         &false,
     );
 
@@ -399,7 +398,6 @@ fn test_reputation_updated_event_emitted_with_old_and_new_score() {
         &String::from_str(&env, "alice"),
         &metadata(&env),
         &CurvePreset::Linear,
-        &0,
         &0,
         &false,
     );

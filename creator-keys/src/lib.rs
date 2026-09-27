@@ -7519,18 +7519,13 @@ impl CreatorKeysContract {
     }
 
     /// Registers a creator key on their behalf with its full initial config:
-    /// zero supply, curve preset, buy cooldown, optional supply cap, metadata
-    /// and an optional `auction_pending` flag. Emits [`events::KeyRegisteredEvent`].
+    /// zero supply, curve preset, buy cooldown, metadata and an optional
+    /// `auction_pending` flag. Emits [`events::KeyRegisteredEvent`].
     ///
     /// The issue text names an authorised factory contract, but this
     /// repository has none, so the caller is gated on the protocol admin.
     /// `auction_mode` only records the `auction_pending` flag; the auction
     /// price and supply are still set by the creator via `configure_auction`.
-    ///
-    /// `supply_cap` sets the hard supply cap enforced by the buy entrypoints
-    /// (issue #997). `0` means the key is uncapped: buys may grow supply without
-    /// limit, `get_supply_info` reports a cap of `0`, and no cap storage is
-    /// written.
     ///
     /// # Errors
     /// - [`ContractError::Unauthorized`] if `admin` is not the protocol admin.
@@ -7548,7 +7543,6 @@ impl CreatorKeysContract {
         metadata: KeyMetadata,
         curve_preset: CurvePreset,
         cooldown_ledgers: u32,
-        supply_cap: u32,
         auction_mode: bool,
     ) -> Result<(), ContractError> {
         admin.require_auth();
@@ -7587,14 +7581,6 @@ impl CreatorKeysContract {
             .persistent()
             .set(&cooldown_key, &cooldown_ledgers);
         extend_key_ttl_to_full_window(&env, &cooldown_key);
-
-        // Optional hard supply cap (issue #997). `0` means unlimited, so the
-        // cap entry is left unwritten for uncapped keys.
-        if supply_cap > 0 {
-            let cap_key = constants::storage::max_supply(&creator);
-            env.storage().persistent().set(&cap_key, &supply_cap);
-            extend_key_ttl_to_full_window(&env, &cap_key);
-        }
 
         let auction_key = constants::storage::auction_pending(&creator);
         env.storage().persistent().set(&auction_key, &auction_mode);

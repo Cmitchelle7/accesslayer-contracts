@@ -11,8 +11,8 @@
 //!    supply past any small ceiling, and `get_supply_info` reports cap `0`
 //!    with unbounded remaining.
 //!
-//! Caps are immutable after registration, so each scenario registers its own
-//! capped creator via `register_key` (the deployment entrypoint).
+//! Caps are immutable once set, so each scenario registers its own creator
+//! and then applies that key's cap via `set_supply_cap`.
 
 mod contract_test_env;
 
@@ -44,7 +44,8 @@ fn setup(env: &Env) -> (CreatorKeysContractClient<'_>, Address) {
     (client, admin)
 }
 
-/// Register a creator key carrying a deployment-time supply cap.
+/// Register a creator key and apply its hard supply cap. A `supply_cap` of
+/// `0` leaves the key uncapped.
 fn register_capped_key(
     env: &Env,
     client: &CreatorKeysContractClient<'_>,
@@ -60,9 +61,11 @@ fn register_capped_key(
         &metadata(env),
         &CurvePreset::Linear,
         &0,
-        &supply_cap,
         &false,
     );
+    if supply_cap > 0 {
+        client.set_supply_cap(&creator, &supply_cap);
+    }
     creator
 }
 
@@ -311,11 +314,11 @@ fn test_zero_cap_allows_unlimited_supply_growth() {
 }
 
 // ---------------------------------------------------------------------------
-// Configuration surface: the cap is stored at deployment
+// Configuration surface: the cap is stored in the key's own config
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_register_key_stores_deployment_supply_cap() {
+fn test_cap_is_stored_in_key_config() {
     let env = test_env_with_auths();
     let (client, admin) = setup(&env);
 
@@ -325,9 +328,35 @@ fn test_register_key_stores_deployment_supply_cap() {
     assert_eq!(info.cap, 7);
     assert_eq!(info.remaining, 7);
 
-    // An uncapped registration (cap 0) writes no cap storage at all.
+    // An uncapped key (cap 0) writes no cap storage at all.
     let uncapped = register_capped_key(&env, &client, &admin, "stored_none", 0);
     assert_eq!(client.get_max_supply(&uncapped), None);
+}
+
+#[test]
+fn test_register_creator_stores_cap_at_registration() {
+    let env = test_env_with_auths();
+    let (client, _admin) = setup(&env);
+
+    // `max_supply` is the optional deployment-time cap.
+    let creator = Address::generate(&env);
+    client.register_creator(
+        &RegisterCreatorParams {
+            creator: creator.clone(),
+            handle: String::from_str(&env, "deploy_cap"),
+        },
+        &None,
+        &Some(5u32),
+        &None,
+        &None,
+        &None,
+    );
+
+    assert_eq!(client.get_max_supply(&creator), Some(5));
+    let info = client.get_supply_info(&creator).unwrap();
+    assert_eq!(info.supply, 0);
+    assert_eq!(info.cap, 5);
+    assert_eq!(info.remaining, 5);
 }
 
 #[test]
