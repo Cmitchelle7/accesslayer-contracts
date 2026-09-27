@@ -84,7 +84,7 @@ fn test_zero_supply_cap_leaves_cap_storage_unwritten() {
     );
 
     // get_supply_info reports cap 0 with unbounded remaining (#997)
-    let info = client.get_supply_info(&creator).unwrap();
+    let info = client.get_supply_info(&creator);
     assert_eq!(info.supply, 0);
     assert_eq!(info.cap, 0);
     assert_eq!(info.remaining, u32::MAX);
