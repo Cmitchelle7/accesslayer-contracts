@@ -188,8 +188,7 @@ fn test_unique_trader_count_after_bulk_trades() {
     let (client, _admin, creator) = setup_env_with_creator(&env);
 
     // Ten wallets, each trading twice — the count must track wallets, not trades.
-    let wallets: std::vec::Vec<Address> =
-        (0..10).map(|_| Address::generate(&env)).collect();
+    let wallets: std::vec::Vec<Address> = (0..10).map(|_| Address::generate(&env)).collect();
 
     for wallet in &wallets {
         client.buy_key(&creator, wallet, &10_000i128, &None);

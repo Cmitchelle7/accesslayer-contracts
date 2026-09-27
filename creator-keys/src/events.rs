@@ -2830,7 +2830,10 @@ pub struct UniqueTraderAddedEvent {
 }
 
 /// Shared unique-trader event topics tuple.
-pub fn unique_trader_added_topics(key_id: &Address, trader: &Address) -> (Symbol, Address, Address) {
+pub fn unique_trader_added_topics(
+    key_id: &Address,
+    trader: &Address,
+) -> (Symbol, Address, Address) {
     (
         UNIQUE_TRADER_ADDED_EVENT_NAME,
         key_id.clone(),
