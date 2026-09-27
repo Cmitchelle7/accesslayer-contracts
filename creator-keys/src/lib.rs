@@ -4970,7 +4970,6 @@ pub enum SwapError {
 #[contract]
 pub struct CreatorKeysContract;
 
-
 #[contractimpl]
 impl CreatorKeysContract {
     /// Registers a new creator profile. This is a contract initialization
@@ -5163,7 +5162,7 @@ impl CreatorKeysContract {
     ) -> Result<KeyRatingAggregate, RatingError> {
         rater.require_auth();
 
-        if score < 1 || score > 5 {
+        if !(1..=5).contains(&score) {
             return Err(RatingError::InvalidScore);
         }
 

@@ -569,4 +569,3 @@ fn test_key_rating_flow_and_rejections() {
     let current_agg = client.get_key_rating(&creator);
     assert_eq!(current_agg, agg3);
 }
-
