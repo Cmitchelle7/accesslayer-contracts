@@ -609,6 +609,9 @@ pub struct KeyInitialisedEvent {
     pub name: String,
     pub bio: String,
     pub avatar_uri: String,
+    pub symbol: String,
+    pub description: String,
+    pub image_cid: String,
 }
 
 pub fn key_initialised_topics(creator_id: &Address) -> (Symbol, Address) {
@@ -2669,14 +2672,18 @@ pub const METADATA_UPDATED_EVENT_NAME: Symbol = symbol_short!("meta_upd");
 pub struct MetadataUpdatedEvent {
     /// Creator whose metadata was updated.
     pub creator_id: Address,
-    /// Updated name, or empty string if unchanged.
+    /// Legacy field; the key name is immutable and this remains empty.
     pub name: String,
-    /// Updated bio, or empty string if unchanged.
+    /// Legacy mirror of `description`; empty when unchanged.
     pub bio: String,
-    /// Updated avatar URI, or empty string if unchanged.
+    /// Legacy mirror of `image_cid`; empty when unchanged.
     pub avatar_uri: String,
     /// Ledger sequence number at the time of the update.
     pub ledger: u32,
+    /// Updated description, or `None` if unchanged.
+    pub description: Option<String>,
+    /// Updated image CID, or `None` if unchanged.
+    pub image_cid: Option<String>,
 }
 
 /// Shared metadata-updated event topics tuple.
