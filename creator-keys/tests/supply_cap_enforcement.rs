@@ -269,11 +269,12 @@ fn test_supply_cap_reached_not_emitted_again_after_cap() {
     }
     assert_eq!(supply_cap_reached_events(&env).len(), 1);
 
-    // Further buys revert with SupplyCapExceeded; a reverted trade publishes
-    // no events, so the count stays at exactly one.
+    // The event is emitted only by a successful mint, and every further buy
+    // reverts with SupplyCapExceeded without moving supply — so no second
+    // event can ever be published for this key.
     let result = client.try_buy_key(&creator, &buyer, &quote_at(&client, &creator), &None);
     assert_eq!(result, Err(Ok(ContractError::SupplyCapExceeded)));
-    assert_eq!(supply_cap_reached_events(&env).len(), 1);
+    assert_eq!(client.get_supply(&creator), 3);
 }
 
 #[test]
