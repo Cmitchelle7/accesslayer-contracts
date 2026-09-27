@@ -12095,6 +12095,7 @@ impl CreatorKeysContract {
         Ok(claimable)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_vesting_cliff(
         env: Env,
         creator: Address,
