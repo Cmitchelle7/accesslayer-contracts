@@ -1,6 +1,5 @@
-#![no_std]
 use crate::ContractError;
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -168,6 +167,11 @@ pub fn is_subscribed(
 }
 
 /// #945: Execute cross-key atomic swap between two parties.
+// Eight parameters, over clippy's limit of seven. Allowed rather than
+// refactored: this is a pre-existing signature for the atomic-swap feature
+// (#945), unrelated to the subscription work that registered this module, and
+// reshaping another feature's public signature is not this change's business.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_atomic_swap(
     env: &Env,
     party_a: &Address,

@@ -1736,6 +1736,44 @@ pub enum DataKey {
     BuybackPoolAddress,
     /// Protocol-wide poll quorum-escalation configuration.
     EscalationConfig,
+    // --- Staking and stake-receipt NFT ---
+    /// (creator, owner) -> total keys staked -> `u32`.
+    StakedKeys(Address, Address),
+    /// token id -> backing stake position -> `u64`-keyed receipt record.
+    StakeNft(u64),
+    /// (creator, stake_id, owner) -> token id -> `u64`.
+    StakeNftId(Address, u32, Address),
+    /// Next token id for a stake receipt mint -> `u64`.
+    NextStakeNftId,
+    /// Total minted stake receipts in existence -> `i128`.
+    StakeNftTotalSupply,
+    /// (creator, owner) -> stake receipt balance -> `u32`.
+    StakeNftHolderCount(Address),
+    /// (owner, spender) -> SEP-41 allowance record.
+    StakeNftAllowance(Address, Address),
+    /// (burner, token id) -> burn marker -> `bool`.
+    StakeNftBurned(Address, u64),
+    // --- Vault rebalancing ---
+    /// creator -> normalized target weights.
+    VaultTargetWeights(Address),
+    /// creator -> current vault allocations.
+    VaultAllocations(Address),
+    /// (creator, key) -> latest reference price -> `i128`.
+    VaultKeyPrice(Address, Address),
+    /// creator -> rebalance drift tolerance in bps -> `u32`.
+    VaultToleranceBps(Address),
+    // --- Dynamic fee tiers ---
+    /// Protocol-wide dynamic fee tier table.
+    FeeTiers,
+    /// Rolling volume buckets, oldest first.
+    FeeVolumeBuckets,
+    /// Index of the active tier in `FeeTiers`.
+    ActiveFeeTierIndex,
+    // --- Bonding curve reset ---
+    /// (creator) -> per-creator curve slope override -> `i128`.
+    CreatorCurveSlope(Address),
+    /// (creator) -> number of completed curve resets -> `u32`.
+    CurveResetCount(Address),
     /// (creator) -> minimum key balance a wallet must hold to subscribe for
     /// gated access (Issue #953). Absent means access gating is not configured
     /// for that creator and `subscribe` rejects.
@@ -6919,8 +6957,14 @@ impl CreatorKeysContract {
         subscriber: Address,
         duration_ledgers: u32,
     ) -> Result<u32, ContractError> {
-        subscriber.require_auth();
-
+        // No `require_auth` here: `subscribe_key_access` performs it, and a
+        // second call on the same frame fails with `Auth(ExistingValue)` —
+        // "frame is already authorized". Authorization is still enforced before
+        // any state change, since the helper requires it before writing.
+        //
+        // The cheap argument checks below therefore run unauthenticated, which
+        // is the right order anyway: a caller should learn that the duration is
+        // zero or that gating is unconfigured without being asked to sign.
         if duration_ledgers == 0 {
             return Err(ContractError::NotPositiveAmount);
         }

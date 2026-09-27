@@ -8,7 +8,7 @@
 mod contract_test_env;
 
 use contract_test_env::{register_creator_keys, register_test_creator, test_env_with_auths};
-use soroban_sdk::testutils::Ledger;
+use creator_keys::CreatorKeysContractClient;
 use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
 
 const MIN_HOLD: u32 = 3;
@@ -16,12 +16,7 @@ const DURATION: u32 = 1_000;
 const KEY_PRICE: i128 = 100;
 
 /// Contract with pricing configured, an admin, and one registered creator.
-fn setup() -> (
-    Env,
-    contract_test_env::CreatorKeysContractClient<'static>,
-    Address,
-    Address,
-) {
+fn setup() -> (Env, CreatorKeysContractClient<'static>, Address, Address) {
     let env = test_env_with_auths();
     // Leaked so the client can outlive this frame; tests are short-lived and the
     // alternative is threading a lifetime through every helper.
@@ -36,12 +31,7 @@ fn setup() -> (
     (env.clone(), client, admin, creator)
 }
 
-fn buy(
-    client: &contract_test_env::CreatorKeysContractClient<'_>,
-    creator: &Address,
-    wallet: &Address,
-    count: u32,
-) {
+fn buy(client: &CreatorKeysContractClient<'_>, creator: &Address, wallet: &Address, count: u32) {
     for _ in 0..count {
         client.buy_key(creator, wallet, &KEY_PRICE, &None);
     }
@@ -51,7 +41,7 @@ fn buy(
 /// lockup window has elapsed.
 fn sell(
     env: &Env,
-    client: &contract_test_env::CreatorKeysContractClient<'_>,
+    client: &CreatorKeysContractClient<'_>,
     creator: &Address,
     wallet: &Address,
     count: u32,
