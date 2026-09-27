@@ -7591,9 +7591,9 @@ impl CreatorKeysContract {
         // Optional hard supply cap (issue #997). `0` means unlimited, so the
         // cap entry is left unwritten for uncapped keys.
         if supply_cap > 0 {
-            let supply_cap_key = constants::storage::max_supply(&creator);
-            env.storage().persistent().set(&supply_cap_key, &supply_cap);
-            extend_key_ttl_to_full_window(&env, &supply_cap_key);
+            let cap_key = constants::storage::max_supply(&creator);
+            env.storage().persistent().set(&cap_key, &supply_cap);
+            extend_key_ttl_to_full_window(&env, &cap_key);
         }
 
         let auction_key = constants::storage::auction_pending(&creator);
@@ -13912,10 +13912,7 @@ impl CreatorKeysContract {
     ///
     /// # Errors
     /// - [`ContractError::NotRegistered`] if the creator is not registered.
-    pub fn get_supply_info(
-        env: Env,
-        key_id: Address,
-    ) -> Result<SupplyInfo, ContractError> {
+    pub fn get_supply_info(env: Env, key_id: Address) -> Result<SupplyInfo, ContractError> {
         let profile = read_registered_creator_profile(&env, &key_id)?;
         let cap_key = constants::storage::max_supply(&key_id);
         let cap: u32 = env.storage().persistent().get(&cap_key).unwrap_or(0);

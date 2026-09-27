@@ -16,9 +16,7 @@
 
 mod contract_test_env;
 
-use contract_test_env::{
-    register_creator_keys, set_pricing_and_fees, test_env_with_auths,
-};
+use contract_test_env::{register_creator_keys, set_pricing_and_fees, test_env_with_auths};
 use creator_keys::events::{SupplyCapReachedEvent, SUPPLY_CAP_REACHED_EVENT_NAME};
 use creator_keys::{
     ContractError, CreatorKeysContractClient, CurvePreset, KeyMetadata, RegisterCreatorParams,
@@ -74,11 +72,7 @@ fn quote_at(client: &CreatorKeysContractClient<'_>, creator: &Address) -> i128 {
 }
 
 /// Buy one key at the current quote, returning the post-buy supply.
-fn buy_one(
-    client: &CreatorKeysContractClient<'_>,
-    creator: &Address,
-    buyer: &Address,
-) -> u32 {
+fn buy_one(client: &CreatorKeysContractClient<'_>, creator: &Address, buyer: &Address) -> u32 {
     let quote = client.get_buy_quote(creator);
     client.buy_key(creator, buyer, &quote.total_amount, &None)
 }
