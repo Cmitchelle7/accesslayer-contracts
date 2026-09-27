@@ -6,6 +6,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
 };
 
+pub mod acl_dividend_twap_gov;
 pub mod acl_limits_merge_sunset;
 pub mod emergency_pause;
 pub mod events;
@@ -17623,3 +17624,6 @@ mod test_issues_924;
 
 #[cfg(test)]
 mod test_issue_1000;
+
+#[cfg(test)]
+mod test_issues_972_971_968_969;
