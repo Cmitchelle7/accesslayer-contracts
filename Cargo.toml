@@ -1,5 +1,5 @@
 [workspace]
-members = ["creator-keys", "creator-keys-factory", "referral-contract"]
+members = ["creator-keys", "creator-keys-factory", "referral-contract", "timelock"]
 resolver = "2"
 
 [workspace.package]
