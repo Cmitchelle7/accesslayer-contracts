@@ -8,6 +8,12 @@ use soroban_sdk::{
 
 pub mod acl_dividend_twap_gov;
 pub mod acl_limits_merge_sunset;
+/// Bonding-curve migration, key subscriptions, and atomic swaps.
+///
+/// Declared here as part of Issue #953 — the file existed but had no `mod`
+/// declaration, so `subscribe_key_access` and `is_subscribed` compiled nowhere
+/// and could not be called.
+pub mod curve_subscriptions_swaps;
 pub mod emergency_pause;
 pub mod events;
 pub mod ratings_royalties_dividends;
@@ -1769,6 +1775,10 @@ pub enum DataKey {
     CreatorCurveSlope(Address),
     /// (creator) -> number of completed curve resets -> `u32`.
     CurveResetCount(Address),
+    /// (creator) -> minimum key balance a wallet must hold to subscribe for
+    /// gated access (Issue #953). Absent means access gating is not configured
+    /// for that creator and `subscribe` rejects.
+    MinHoldForAccess(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1787,6 +1797,31 @@ pub struct ReinvestResult {
 pub enum StakingKey {
     /// Next sequential stake id for a `(creator, holder)` pair -> `u32`.
     NextStakeId(Address, Address),
+}
+
+/// Storage keys for key ratings, bundle offerings, performance bonds and atomic
+/// swaps.
+///
+/// Kept separate from [`DataKey`] to stay within Soroban's 50-variant
+/// `#[contracttype]` cap.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum FeatureKey {
+    // --- Key ratings ---
+    /// (creator) -> aggregate `KeyRatingAggregate` struct.
+    KeyRatingAggregate(Address),
+    /// (creator, rater) -> individual score submitted by `rater` -> `u32`.
+    HolderKeyRating(Address, Address),
+    // --- Bundle offerings ---
+    /// (bundle_id) -> `KeyBundle` struct.
+    KeyBundle(u64),
+    /// Next sequential bundle id -> `u64`.
+    NextBundleId,
+    // --- Performance bonds ---
+    /// (creator) -> locked performance bond amount in stroops -> `i128`.
+    PerformanceBond(Address),
+    /// Protocol-wide minimum performance bond amount configured by admin -> `i128`.
+    MinPerformanceBond,
 }
 
 /// Storage keys for the cycle-based protocol revenue distribution (#877).
@@ -4574,6 +4609,18 @@ fn accrue_trade_analytics(
         let current_ut: u64 = env.storage().persistent().get(&ut_key).unwrap_or(0);
         let new_ut = current_ut.checked_add(1).ok_or(ContractError::Overflow)?;
         env.storage().persistent().set(&ut_key, &new_ut);
+
+        // Emitted only inside this branch, so an indexer gets exactly one
+        // event per wallet per creator rather than one per trade.
+        env.events().publish(
+            events::unique_trader_added_topics(creator, trader),
+            events::UniqueTraderAddedEvent {
+                key_id: creator.clone(),
+                trader: trader.clone(),
+                unique_trader_count: new_ut,
+                ledger: env.ledger().sequence(),
+            },
+        );
     }
 
     // Accumulate volume
@@ -4828,6 +4875,121 @@ fn is_escalation_eligible(
     (participation_bps as u128) >= required_bps
 }
 
+// ============================================================================
+// Feature structs: key ratings, bundle offerings, performance bonds, atomic swaps
+// ============================================================================
+
+/// Aggregated rating summary for a creator key.
+///
+/// `total_score` is the sum of all individual scores, `count` is the number of
+/// unique raters, and `average_score_scaled` is `(total_score * 100) / count`
+/// (e.g. 450 == 4.50 stars).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyRatingAggregate {
+    pub total_score: u64,
+    pub count: u32,
+    /// Running average × 100 (e.g. 450 == 4.50 stars).
+    pub average_score_scaled: u32,
+}
+
+/// Errors raised by [`CreatorKeysContract::rate_key`].
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RatingError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The score is outside the accepted range (1–5).
+    InvalidScore = 2,
+    /// The rater holds zero keys for this creator.
+    NotAHolder = 3,
+}
+
+/// A single entry inside a key bundle (key ID + quantity).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct BundleEntry {
+    pub key_id: Address,
+    pub quantity: u32,
+}
+
+/// A creator-defined bundle of multiple keys sold at a discounted combined price.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyBundle {
+    pub bundle_id: u64,
+    pub creator: Address,
+    pub entries: Vec<BundleEntry>,
+    /// Discounted total price in stroops; must be ≥ `min_price_floor`.
+    pub discounted_price: i128,
+    /// Ledger at which the bundle expires (inclusive).
+    pub expires_at_ledger: u32,
+}
+
+/// Errors raised by bundle entrypoints.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum BundleError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The discounted price is below the minimum price floor.
+    BelowPriceFloor = 2,
+    /// The bundle has expired.
+    BundleExpired = 3,
+    /// The bundle was not found.
+    BundleNotFound = 4,
+    /// The bundle entry list is empty.
+    EmptyBundle = 5,
+    /// The buyer has insufficient balance.
+    InsufficientBalance = 6,
+    /// Arithmetic overflow.
+    Overflow = 7,
+    /// The caller is not the bundle creator.
+    Unauthorized = 8,
+    /// The protocol is paused.
+    ProtocolPaused = 9,
+}
+
+/// Errors raised by performance bond entrypoints.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum BondError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The bond amount is below the configured minimum.
+    BelowMinimumBond = 2,
+    /// No bond has been staked for this creator.
+    BondNotFound = 3,
+    /// The caller is not the protocol admin.
+    Unauthorized = 4,
+    /// Arithmetic overflow.
+    Overflow = 5,
+    /// The bond amount is not positive.
+    NotPositiveAmount = 6,
+}
+
+/// Errors raised by [`CreatorKeysContract::atomic_swap`].
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SwapError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// One side has insufficient liquid balance.
+    InsufficientBalance = 2,
+    /// One wallet's position is frozen.
+    FrozenPosition = 3,
+    /// Arithmetic overflow in fee calculation.
+    Overflow = 4,
+    /// The protocol is paused.
+    ProtocolPaused = 5,
+    /// Swap amount is zero.
+    ZeroAmount = 6,
+}
+
 #[contract]
 pub struct CreatorKeysContract;
 
@@ -5011,6 +5173,102 @@ impl CreatorKeysContract {
         );
 
         Ok(())
+    }
+
+    /// Rates a creator key (score 1-5). Requires non-zero key holding balance.
+    /// Emits `KeyRated` event and maintains incremental running average.
+    pub fn rate_key(
+        env: Env,
+        creator: Address,
+        rater: Address,
+        score: u32,
+    ) -> Result<KeyRatingAggregate, RatingError> {
+        rater.require_auth();
+
+        if !(1..=5).contains(&score) {
+            return Err(RatingError::InvalidScore);
+        }
+
+        let creator_key = constants::storage::creator(&creator);
+        if !env.storage().persistent().has(&creator_key) {
+            return Err(RatingError::NotRegistered);
+        }
+
+        let holder_bal = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&constants::storage::holder_balance_key(&creator, &rater))
+            .unwrap_or(0);
+        if holder_bal == 0 {
+            return Err(RatingError::NotAHolder);
+        }
+
+        let agg_key = FeatureKey::KeyRatingAggregate(creator.clone());
+        let mut agg = env
+            .storage()
+            .persistent()
+            .get::<_, KeyRatingAggregate>(&agg_key)
+            .unwrap_or(KeyRatingAggregate {
+                total_score: 0,
+                count: 0,
+                average_score_scaled: 0,
+            });
+
+        let rater_key = FeatureKey::HolderKeyRating(creator.clone(), rater.clone());
+        if let Some(prev_score) = env.storage().persistent().get::<_, u32>(&rater_key) {
+            agg.total_score = agg
+                .total_score
+                .checked_sub(prev_score as u64)
+                .ok_or(RatingError::NotRegistered)?
+                .checked_add(score as u64)
+                .ok_or(RatingError::NotRegistered)?;
+        } else {
+            agg.count = agg.count.checked_add(1).ok_or(RatingError::NotRegistered)?;
+            agg.total_score = agg
+                .total_score
+                .checked_add(score as u64)
+                .ok_or(RatingError::NotRegistered)?;
+        }
+
+        agg.average_score_scaled = if agg.count > 0 {
+            ((agg.total_score as u128 * 100) / (agg.count as u128)) as u32
+        } else {
+            0
+        };
+
+        env.storage().persistent().set(&rater_key, &score);
+        extend_key_ttl_to_full_window(&env, &rater_key);
+
+        env.storage().persistent().set(&agg_key, &agg);
+        extend_key_ttl_to_full_window(&env, &agg_key);
+
+        env.events().publish(
+            events::key_rated_topics(&creator, &rater),
+            events::KeyRatedEvent {
+                creator: creator.clone(),
+                rater: rater.clone(),
+                score,
+                total_score: agg.total_score,
+                count: agg.count,
+                average_score_scaled: agg.average_score_scaled,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(agg)
+    }
+
+    /// Gets the current rating aggregate for a creator key.
+    pub fn get_key_rating(env: Env, creator: Address) -> KeyRatingAggregate {
+        let agg_key = FeatureKey::KeyRatingAggregate(creator);
+        env.storage()
+            .persistent()
+            .get::<_, KeyRatingAggregate>(&agg_key)
+            .unwrap_or(KeyRatingAggregate {
+                total_score: 0,
+                count: 0,
+                average_score_scaled: 0,
+            })
     }
 
     pub fn buy_key(
@@ -6877,6 +7135,139 @@ impl CreatorKeysContract {
     /// that has never bought or been transferred keys, or that has sold all keys, without panicking or returning an error.
     pub fn get_balance(env: Env, creator: Address, wallet: Address) -> u32 {
         Self::get_key_balance(env, creator, wallet)
+    }
+
+    // ── Subscription access gating (Issue #953) ────────────────────────────
+    //
+    // `curve_subscriptions_swaps::subscribe_key_access` takes the subscriber's
+    // balance and the minimum as *parameters*. That is fine for an internal
+    // helper but must never be the contract's surface: a caller-supplied
+    // `subscriber_balance` makes the minimum-hold check self-attested, so any
+    // wallet could claim to hold enough and gate itself in.
+    //
+    // These entry points read both values from storage instead — the balance via
+    // `get_key_balance`, the minimum from `DataKey::MinHoldForAccess` — so the
+    // threshold is enforced against what the ledger actually says.
+
+    /// Sets the minimum key balance a wallet must hold to subscribe.
+    ///
+    /// Admin-only. The creator is deliberately *not* allowed to set their own
+    /// threshold: it gates paid access, so a creator who could lower it at will
+    /// could grant access to wallets holding nothing, which is the outcome the
+    /// gate exists to prevent.
+    pub fn set_min_hold_for_access(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        min_keys: u32,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+
+        if min_keys == 0 {
+            // Zero would gate nothing while looking configured. Removing the
+            // key is the honest way to disable gating, and `subscribe` reports
+            // that state distinctly.
+            return Err(ContractError::NotPositiveAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinHoldForAccess(creator.clone()), &min_keys);
+
+        env.events()
+            .publish((soroban_sdk::symbol_short!("MIN_HOLD"), creator), min_keys);
+
+        Ok(())
+    }
+
+    /// The configured minimum hold for a creator, or `None` when gating is off.
+    pub fn get_min_hold_for_access(env: Env, creator: Address) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinHoldForAccess(creator))
+    }
+
+    /// Subscribes `subscriber` to `creator`'s gated access for
+    /// `duration_ledgers`, provided they hold at least the configured minimum.
+    ///
+    /// The balance is read from storage, not supplied by the caller. Returns the
+    /// expiry ledger.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotPositiveAmount`] if `duration_ledgers` is zero — a
+    ///   subscription expiring on the ledger it was created in is never usable.
+    /// - [`ContractError::NotRegistered`] if no minimum is configured for the
+    ///   creator. Reported distinctly from an insufficient balance so an
+    ///   operator can tell "gating is off" from "you need more keys".
+    /// - [`ContractError::InsufficientBalance`] if the wallet holds less than
+    ///   the minimum.
+    pub fn subscribe(
+        env: Env,
+        creator: Address,
+        subscriber: Address,
+        duration_ledgers: u32,
+    ) -> Result<u32, ContractError> {
+        // No `require_auth` here: `subscribe_key_access` performs it, and a
+        // second call on the same frame fails with `Auth(ExistingValue)` —
+        // "frame is already authorized". Authorization is still enforced before
+        // any state change, since the helper requires it before writing.
+        //
+        // The cheap argument checks below therefore run unauthenticated, which
+        // is the right order anyway: a caller should learn that the duration is
+        // zero or that gating is unconfigured without being asked to sign.
+        if duration_ledgers == 0 {
+            return Err(ContractError::NotPositiveAmount);
+        }
+
+        let min_keys: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinHoldForAccess(creator.clone()))
+            .ok_or(ContractError::NotRegistered)?;
+
+        let balance = Self::get_key_balance(env.clone(), creator.clone(), subscriber.clone());
+
+        crate::curve_subscriptions_swaps::subscribe_key_access(
+            &env,
+            &creator,
+            &subscriber,
+            duration_ledgers,
+            min_keys,
+            balance,
+        )
+    }
+
+    /// Whether `subscriber` currently has gated access to `creator`.
+    ///
+    /// Re-checks the live balance against the minimum recorded on the
+    /// subscription, so access lapses the moment a holder sells below the
+    /// threshold — no revocation transaction required. That is what "revoked
+    /// automatically when holding drops below minimum" means here: the gate is
+    /// evaluated on read rather than swept by a job, so there is no window in
+    /// which a sold-out wallet still passes.
+    ///
+    /// Returns `false` for an unknown subscription, an expired one, or a
+    /// balance that has since fallen below the recorded minimum.
+    pub fn is_subscribed(env: Env, creator: Address, subscriber: Address) -> bool {
+        let balance = Self::get_key_balance(env.clone(), creator.clone(), subscriber.clone());
+        crate::curve_subscriptions_swaps::is_subscribed(&env, &creator, &subscriber, balance)
+    }
+
+    /// The stored subscription record, if any.
+    ///
+    /// Exposed alongside [`Self::is_subscribed`] because the boolean alone
+    /// cannot tell a caller *why* access was denied — expired, or under the
+    /// threshold. A UI needs to say which.
+    pub fn get_subscription(
+        env: Env,
+        creator: Address,
+        subscriber: Address,
+    ) -> Option<crate::curve_subscriptions_swaps::KeySubscription> {
+        env.storage().instance().get(
+            &crate::curve_subscriptions_swaps::EmdevelopaDataKey::Subscription(creator, subscriber),
+        )
     }
 
     /// Read-only view: returns a stable view of a holder's key count for a creator.
@@ -14240,6 +14631,42 @@ impl CreatorKeysContract {
         })
     }
 
+    /// Read-only view: returns how many distinct wallets have traded a
+    /// creator's keys.
+    ///
+    /// A wallet is counted once, on its first buy or sell; later trades from
+    /// the same wallet do not change the value. Equivalent to the
+    /// `unique_traders` field of [`Self::get_analytics`], exposed on its own so
+    /// callers that only need the count do not pay for the other two reads.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotRegistered`] if the creator is not registered.
+    pub fn get_unique_trader_count(env: Env, key_id: Address) -> Result<u64, ContractError> {
+        read_registered_creator_profile(&env, &key_id)?;
+        Ok(env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&constants::storage::unique_trader_count(&key_id))
+            .unwrap_or(0))
+    }
+
+    /// Read-only view: returns whether `wallet` has ever traded `key_id`.
+    ///
+    /// True from the wallet's first buy or sell onwards. Selling a position
+    /// down to zero does not reset it — the flag records that a trade happened,
+    /// not that a balance is held.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotRegistered`] if the creator is not registered.
+    pub fn has_traded(env: Env, key_id: Address, wallet: Address) -> Result<bool, ContractError> {
+        read_registered_creator_profile(&env, &key_id)?;
+        Ok(env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&constants::storage::has_traded(&key_id, &wallet))
+            .unwrap_or(false))
+    }
+
     // -----------------------------------------------------------------------
     // Feature: creator reputation scoring
     // -----------------------------------------------------------------------
@@ -17620,10 +18047,7 @@ mod test_staking_lifecycle;
 mod test_issues_904_905_906_908;
 
 #[cfg(test)]
-mod test_issues_924;
+mod test_unique_traders;
 
 #[cfg(test)]
 mod test_issue_1000;
-
-#[cfg(test)]
-mod test_issues_972_971_968_969;
