@@ -1718,7 +1718,7 @@ pub enum DataKey {
     /// Per-creator count of unique wallets that have ever traded.
     UniqueTraderCount(Address),
     /// Per-creator per-wallet flag: true if this wallet has ever traded.
-        HasTraded(Address, Address),
+    HasTraded(Address, Address),
 
     /// (creator) -> accumulated reputation score (`i128`, floored at zero).
     ReputationScore(Address),
@@ -10569,7 +10569,19 @@ impl CreatorKeysContract {
         stake_id: u32,
     ) -> Result<StakeExit, StakingError> {
         holder.require_auth();
-    }
+        assert_not_paused(&env).map_err(map_staking_error)?;
+
+        let position_key = constants::storage::staking_position(&creator, &holder, stake_id);
+        let position: StakePosition = env
+            .storage()
+            .persistent()
+            .get(&position_key)
+            .ok_or(StakingError::PositionNotFound)?;
+
+        if env.ledger().sequence() >= position.unlock_ledger {
+            return Err(StakingError::PositionNotLocked);
+        }
+
         let pool_key = constants::storage::staking_rewards_pool(&creator);
         let mut state: StakingRewardsState =
             env.storage()
