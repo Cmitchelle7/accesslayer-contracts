@@ -153,11 +153,11 @@ fn test_partial_fill_exactly_reaching_cap_succeeds() {
 
     // A batch buy of exactly 2 fills the key to its cap and must succeed.
     let quote = client.get_buy_quote(&creator);
-    let bought = client.buy_keys(&creator, &buyer, &2, &quote.total_amount * 10, &None);
+    let bought = client.buy_keys(&creator, &buyer, &2, &(quote.total_amount * 10), &None);
     assert_eq!(bought, 2);
     assert_eq!(client.get_supply(&creator), 10);
 
-    let info = client.get_supply_info(&creator).unwrap();
+    let info = client.get_supply_info(&creator);
     assert_eq!(info.supply, info.cap);
     assert_eq!(info.remaining, 0);
 }
@@ -173,7 +173,7 @@ fn test_single_buy_that_reaches_cap_exactly_succeeds() {
     let supply = buy_one(&client, &creator, &buyer);
     assert_eq!(supply, 1);
 
-    let info = client.get_supply_info(&creator).unwrap();
+    let info = client.get_supply_info(&creator);
     assert_eq!(info.supply, 1);
     assert_eq!(info.cap, 1);
     assert_eq!(info.remaining, 0);
@@ -191,7 +191,7 @@ fn test_get_supply_info_tracks_supply_cap_and_remaining() {
     let buyer = Address::generate(&env);
 
     // Freshly deployed key: nothing minted yet.
-    let info = client.get_supply_info(&creator).unwrap();
+    let info = client.get_supply_info(&creator);
     assert_eq!(info.supply, 0);
     assert_eq!(info.cap, 5);
     assert_eq!(info.remaining, 5);
@@ -199,14 +199,14 @@ fn test_get_supply_info_tracks_supply_cap_and_remaining() {
     // Mid-curve values stay consistent after every buy.
     for expected_supply in 1..=5u32 {
         buy_one(&client, &creator, &buyer);
-        let info = client.get_supply_info(&creator).unwrap();
+        let info = client.get_supply_info(&creator);
         assert_eq!(info.supply, expected_supply);
         assert_eq!(info.cap, 5);
         assert_eq!(info.remaining, 5 - expected_supply);
     }
 
     // At the cap the remaining count is exactly zero.
-    let info = client.get_supply_info(&creator).unwrap();
+    let info = client.get_supply_info(&creator);
     assert_eq!(info.supply, 5);
     assert_eq!(info.remaining, 0);
 }
@@ -249,7 +249,7 @@ fn test_supply_cap_reached_emitted_once_for_partial_fill_reaching_cap() {
 
     // The batch fill that lands on the cap emits exactly one event.
     let quote = client.get_buy_quote(&creator);
-    client.buy_keys(&creator, &buyer, &2, &quote.total_amount * 10, &None);
+    client.buy_keys(&creator, &buyer, &2, &(quote.total_amount * 10), &None);
 
     let events = supply_cap_reached_events(&env);
     assert_eq!(events.len(), 1);
@@ -307,7 +307,7 @@ fn test_zero_cap_allows_unlimited_supply_growth() {
         assert_eq!(supply, expected);
     }
 
-    let info = client.get_supply_info(&creator).unwrap();
+    let info = client.get_supply_info(&creator);
     assert_eq!(info.supply, 20);
     assert_eq!(info.cap, 0);
     assert_eq!(info.remaining, u32::MAX);
@@ -324,7 +324,7 @@ fn test_cap_is_stored_in_key_config() {
 
     let capped = register_capped_key(&env, &client, &admin, "stored_cap", 7);
     assert_eq!(client.get_max_supply(&capped), Some(7));
-    let info = client.get_supply_info(&capped).unwrap();
+    let info = client.get_supply_info(&capped);
     assert_eq!(info.cap, 7);
     assert_eq!(info.remaining, 7);
 
@@ -350,10 +350,11 @@ fn test_register_creator_stores_cap_at_registration() {
         &None,
         &None,
         &None,
+        &None,
     );
 
     assert_eq!(client.get_max_supply(&creator), Some(5));
-    let info = client.get_supply_info(&creator).unwrap();
+    let info = client.get_supply_info(&creator);
     assert_eq!(info.supply, 0);
     assert_eq!(info.cap, 5);
     assert_eq!(info.remaining, 5);
@@ -379,7 +380,7 @@ fn test_register_creator_zero_cap_is_unlimited() {
     );
 
     // #997: cap 0 registers as unlimited rather than reverting.
-    let info = client.get_supply_info(&creator).unwrap();
+    let info = client.get_supply_info(&creator);
     assert_eq!(info.cap, 0);
     assert_eq!(info.remaining, u32::MAX);
 }
