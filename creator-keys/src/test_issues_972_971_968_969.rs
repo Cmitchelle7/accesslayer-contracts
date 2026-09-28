@@ -489,3 +489,83 @@ fn test_governance_proposal_contract_client() {
     let final_status = client.execute_proposal(&admin, &prop_id);
     assert_eq!(final_status, ProposalStatus::Executed);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KEY RATING TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_key_rating_flow_and_rejections() {
+    use crate::{
+        CreatorKeysContract, CreatorKeysContractClient, RatingError, RegisterCreatorParams,
+    };
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CreatorKeysContract, ());
+    let client = CreatorKeysContractClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let rater1 = Address::generate(&env);
+    let rater2 = Address::generate(&env);
+    let non_holder = Address::generate(&env);
+
+    // Register creator
+    let handle = String::from_str(&env, "alice");
+    client.register_creator(
+        &RegisterCreatorParams {
+            creator: creator.clone(),
+            handle,
+        },
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Non-holder attempts to rate -> fails with NotAHolder
+    let res = client.try_rate_key(&creator, &non_holder, &5);
+    assert_eq!(res, Err(Ok(RatingError::NotAHolder)));
+
+    // Setup protocol admin, fee config, and key price
+    let admin = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
+    client.set_protocol_admin(&admin, &admin);
+    client.set_fee_config(&admin, &9000, &1000);
+    client.set_protocol_fee_recipient(&admin, &fee_recipient);
+    client.set_key_price(&admin, &10_000_000);
+
+    client.buy_key(&creator, &rater1, &100_000_000, &None);
+    client.buy_key(&creator, &rater2, &100_000_000, &None);
+
+    // Invalid score (< 1 or > 5)
+    let res = client.try_rate_key(&creator, &rater1, &0);
+    assert_eq!(res, Err(Ok(RatingError::InvalidScore)));
+    let res = client.try_rate_key(&creator, &rater1, &6);
+    assert_eq!(res, Err(Ok(RatingError::InvalidScore)));
+
+    // First rating from rater1 (score 4)
+    let agg1 = client.rate_key(&creator, &rater1, &4);
+    assert_eq!(agg1.count, 1);
+    assert_eq!(agg1.total_score, 4);
+    assert_eq!(agg1.average_score_scaled, 400); // 4.00 stars
+
+    // Rating from rater2 (score 5)
+    let agg2 = client.rate_key(&creator, &rater2, &5);
+    assert_eq!(agg2.count, 2);
+    assert_eq!(agg2.total_score, 9);
+    assert_eq!(agg2.average_score_scaled, 450); // 4.50 stars
+
+    // Re-rating from rater1 (update score 4 -> 2)
+    let agg3 = client.rate_key(&creator, &rater1, &2);
+    assert_eq!(agg3.count, 2); // count remains 2
+    assert_eq!(agg3.total_score, 7); // (9 - 4 + 2)
+    assert_eq!(agg3.average_score_scaled, 350); // 3.50 stars
+
+    // Verify getter view
+    let current_agg = client.get_key_rating(&creator);
+    assert_eq!(current_agg, agg3);
+}
