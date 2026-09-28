@@ -15,6 +15,7 @@ pub mod acl_limits_merge_sunset;
 /// and could not be called.
 pub mod curve_subscriptions_swaps;
 pub mod events;
+pub mod lp_reward;
 pub mod ratings_royalties_dividends;
 
 pub mod test_feature_impl;
@@ -15291,6 +15292,67 @@ impl CreatorKeysContract {
 
         Ok(new_expires_at)
     }
+
+    // =========================================================================
+    // Issue #1002: Liquidity provider reward contract for key pairs
+    // =========================================================================
+
+    /// Locks tokens as liquidity and records LP share.
+    pub fn add_liquidity(
+        env: Env,
+        key_id: Address,
+        provider: Address,
+        amount: i128,
+    ) -> Result<u64, lp_reward::LpRewardError> {
+        lp_reward::add_liquidity(&env, key_id, provider, amount)
+    }
+
+    /// Convenience alias with (provider, key_id, amount) parameter order.
+    pub fn add_liquidity_for(
+        env: Env,
+        provider: Address,
+        key_id: Address,
+        amount: i128,
+    ) -> Result<u64, lp_reward::LpRewardError> {
+        lp_reward::add_liquidity(&env, key_id, provider, amount)
+    }
+
+    /// Returns tokens plus accrued fee rewards, closing the position.
+    pub fn remove_liquidity(env: Env, lp_id: u64) -> Result<i128, lp_reward::LpRewardError> {
+        lp_reward::remove_liquidity(&env, lp_id)
+    }
+
+    /// Claims rewards without removing liquidity.
+    pub fn claim_lp_rewards(env: Env, lp_id: u64) -> Result<i128, lp_reward::LpRewardError> {
+        lp_reward::claim_lp_rewards(&env, lp_id)
+    }
+
+    /// Returns contribution, share, and pending rewards at any point.
+    pub fn get_lp_position(
+        env: Env,
+        lp_id: u64,
+    ) -> Result<lp_reward::LpPosition, lp_reward::LpRewardError> {
+        lp_reward::get_lp_position(&env, lp_id)
+    }
+
+    /// Accrues fee rewards to key pair pool proportional to trading volume.
+    pub fn accrue_lp_trading_fee(
+        env: Env,
+        key_id: Address,
+        fee_amount: i128,
+    ) -> Result<(), lp_reward::LpRewardError> {
+        lp_reward::accrue_trading_fee(&env, key_id, fee_amount)
+    }
+
+    /// Read-only view of total pool liquidity for a key pair.
+    pub fn get_lp_total_liquidity(env: Env, key_id: Address) -> i128 {
+        lp_reward::get_total_liquidity(&env, key_id)
+    }
+
+    /// Read-only view of total collected trading rewards for a key pair.
+    pub fn get_lp_pool_rewards(env: Env, key_id: Address) -> i128 {
+        lp_reward::get_pool_rewards(&env, key_id)
+    }
 }
 
 // ============================================================================
@@ -17979,3 +18041,6 @@ mod test_issues_904_905_906_908;
 
 #[cfg(test)]
 mod test_unique_traders;
+
+#[cfg(test)]
+mod test_lp_reward;
