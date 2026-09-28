@@ -841,6 +841,34 @@ pub fn supply_cap_set_topics(creator: &Address) -> (Symbol, Address) {
     (SUPPLY_CAP_SET_EVENT_NAME, creator.clone())
 }
 
+/// Event name emitted exactly once when a buy fills a capped key's supply to
+/// its configured cap. Subsequent buys revert with `SupplyCapExceeded`, so the
+/// event is never emitted again for the same key.
+pub const SUPPLY_CAP_REACHED_EVENT_NAME: Symbol = symbol_short!("cap_reach");
+
+/// Stable supply-cap-reached event payload.
+///
+/// Event shape:
+/// - topics: `(SUPPLY_CAP_REACHED_EVENT_NAME, creator_id)`
+/// - data: `SupplyCapReachedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SupplyCapReachedEvent {
+    /// Creator whose key supply just reached the configured cap.
+    pub creator_id: Address,
+    /// New total supply, which now equals the configured cap.
+    pub new_supply: u32,
+    /// The configured cap that was reached.
+    pub cap: u32,
+    /// Ledger in which the cap was reached.
+    pub ledger: u32,
+}
+
+/// Shared supply-cap-reached event topics tuple.
+pub fn supply_cap_reached_topics(creator: &Address) -> (Symbol, Address) {
+    (SUPPLY_CAP_REACHED_EVENT_NAME, creator.clone())
+}
+
 // --- Multisig pause events ---
 
 /// Event name for pause proposal.
