@@ -43,7 +43,8 @@ use crate::{
     CreatorKeysContract, CreatorKeysContractArgs, CreatorKeysContractClient, VaultAllocation,
 };
 use soroban_sdk::{
-    contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
+    contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol,
+    Vec,
 };
 
 /// Event name for protocol trade fee collected on a buy or sell.
@@ -2648,6 +2649,75 @@ pub fn action_executed_topics(action_id: u32) -> (Symbol, u32) {
 /// Shared action cancelled event topics tuple.
 pub fn action_cancelled_topics(action_id: u32) -> (Symbol, u32) {
     (ACTION_CANCELLED_EVENT_NAME, action_id)
+}
+
+// ============================================================================
+// Feature: timelocked contract upgrade — LogicUpgraded / UpgradeApproved
+// ============================================================================
+
+/// Event name emitted when a timelocked upgrade swaps the contract's logic build.
+///
+/// Emitted alongside (never instead of) `UpgradeExecutedEvent`, so indexers
+/// already tracking the legacy `upgraded` event keep working unchanged.
+pub const LOGIC_UPGRADED_EVENT_NAME: Symbol = symbol_short!("logic_upg");
+
+/// Stable payload describing a completed timelocked logic upgrade.
+///
+/// Carries both the outgoing and incoming logic identity, which is the whole
+/// point of the event: an operator can diff the pair to confirm which build is
+/// live and, if it misbehaved, which build to propose a rollback to.
+///
+/// Event shape:
+/// - topics: `(LOGIC_UPGRADED_EVENT_NAME, action_id)`
+/// - data: `LogicUpgradedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct LogicUpgradedEvent {
+    /// Timelocked action that carried out the swap.
+    pub action_id: u32,
+    /// Logic (WASM) hash in effect before the upgrade. `None` on the first
+    /// recorded upgrade, when no prior hash has been retained yet.
+    pub old_wasm_hash: Option<BytesN<32>>,
+    /// Logic (WASM) hash now in effect.
+    pub new_wasm_hash: BytesN<32>,
+    pub old_version: u32,
+    pub new_version: u32,
+    /// Ledger timestamp (seconds) at which the swap was applied.
+    pub executed_at: u64,
+}
+
+/// Shared logic-upgraded event topics tuple.
+pub fn logic_upgraded_topics(action_id: u32) -> (Symbol, u32) {
+    (LOGIC_UPGRADED_EVENT_NAME, action_id)
+}
+
+/// Event name emitted when one member of the multi-sig admin set approves a
+/// pending timelocked upgrade.
+pub const UPGRADE_APPROVED_EVENT_NAME: Symbol = symbol_short!("upg_appr");
+
+/// Stable payload for a single multi-sig approval of a pending upgrade.
+///
+/// Event shape:
+/// - topics: `(UPGRADE_APPROVED_EVENT_NAME, action_id)`
+/// - data: `UpgradeApprovedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct UpgradeApprovedEvent {
+    /// Timelocked action being approved.
+    pub action_id: u32,
+    /// Admin that cast this approval.
+    pub admin: Address,
+    /// Total distinct approvals recorded so far, including this one.
+    pub approvals: u32,
+    /// Distinct approvals required before the upgrade may execute.
+    pub threshold: u32,
+    /// Ledger timestamp (seconds) of the approval.
+    pub approved_at: u64,
+}
+
+/// Shared upgrade-approved event topics tuple.
+pub fn upgrade_approved_topics(action_id: u32) -> (Symbol, u32) {
+    (UPGRADE_APPROVED_EVENT_NAME, action_id)
 }
 
 // ============================================================================

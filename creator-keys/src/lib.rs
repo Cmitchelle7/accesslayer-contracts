@@ -3,7 +3,7 @@
 pub mod quote_view_errors;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Vec,
 };
 
 pub mod acl_dividend_twap_gov;
@@ -176,6 +176,19 @@ pub enum ContractError {
     InvalidTargetWeights = 95,
     /// The supplied target weights are not normalized to the permitted total.
     TargetWeightsNotNormalized = 96,
+    // --- Timelocked contract upgrade ---
+    /// A timelocked WASM upgrade was executed before enough members of the
+    /// multi-sig admin set had approved it.
+    UpgradeApprovalThresholdNotMet = 97,
+    /// The payload of a `TimelockChangeType::Upgrade` action is not a 32-byte
+    /// WASM hash.
+    InvalidUpgradePayload = 98,
+    /// A timelocked WASM upgrade was attempted while the protocol is frozen
+    /// (either `pause` or the 2-of-N `global_pause` is active).
+    ContractFrozen = 99,
+    /// The supplied timelocked action is not of the change type the caller
+    /// requires (for example approving a non-upgrade action).
+    InvalidChangeType = 100,
 }
 
 /// Errors raised by the staking entrypoints
@@ -865,6 +878,12 @@ pub mod constants {
         pub const ORACLE_STALENESS_SECS: DataKey = DataKey::OracleStalenessSecs;
         pub const ACTION_NEXT_ID: DataKey = DataKey::ActionNextId;
         pub const TIMELOCK_DELAY_SECS: DataKey = DataKey::TimelockDelaySecs;
+        /// WASM hash staged for the next timelocked upgrade.
+        pub const PENDING_UPGRADE_WASM: DataKey = DataKey::PendingUpgradeWasm;
+        /// WASM hash applied by the most recent timelocked upgrade.
+        pub const LAST_APPLIED_WASM: DataKey = DataKey::LastAppliedWasm;
+        /// WASM hash in effect immediately before the most recent upgrade.
+        pub const PREVIOUS_WASM: DataKey = DataKey::PreviousWasm;
         pub const GOVERNANCE_ADDRESS: DataKey = DataKey::GovernanceAddress;
         pub const SNAPSHOT_RETENTION_LEDGERS: DataKey = DataKey::SnapshotRetentionLedgers;
 
@@ -878,6 +897,12 @@ pub mod constants {
 
         pub fn action_proposal(action_id: u32) -> DataKey {
             DataKey::ActionProposal(action_id)
+        }
+
+        /// Storage key for a multi-sig approval vote by `admin` on the
+        /// timelocked upgrade identified by `action_id`.
+        pub fn upgrade_approval_vote(admin: &Address, action_id: u32) -> DataKey {
+            DataKey::UpgradeApprovalVote(admin.clone(), action_id)
         }
 
         pub fn vault_shares(creator: &Address, holder: &Address) -> DataKey {
@@ -1711,6 +1736,16 @@ pub enum DataKey {
     ActionNextId,
     /// Configured timelock delay in seconds for new actions.
     TimelockDelaySecs,
+    /// WASM hash staged for the next timelocked upgrade by `propose_upgrade`.
+    PendingUpgradeWasm,
+    /// WASM hash applied by the most recent timelocked upgrade. Retained so the
+    /// previous logic build stays reachable: an incident is reversed by
+    /// proposing a fresh upgrade back to it, never by an ad-hoc setter.
+    LastAppliedWasm,
+    /// WASM hash that was in effect immediately before `LastAppliedWasm`.
+    PreviousWasm,
+    /// `(admin, action_id)` -> multi-sig approval vote for a timelocked upgrade.
+    UpgradeApprovalVote(Address, u32),
     /// Address of the authorised governance contract that may call `take_snapshot`.
     GovernanceAddress,
     /// Snapshot retention window in ledgers; snapshots older than this are pruned.
@@ -2061,6 +2096,14 @@ pub enum TimelockChangeType {
     Fee = 0,
     CurveExponent = 1,
     Treasury = 2,
+    /// Swap the contract's logic to a new WASM build.
+    ///
+    /// The 32-byte WASM hash travels in [`TimelockAction::payload`]. Requires
+    /// 2-of-N multi-sig approval on top of the timelock delay before it applies.
+    ///
+    /// This is the only change type whose payload is acted on; see
+    /// [`execute_action`](crate::CreatorKeysContract::execute_action).
+    Upgrade = 3,
 }
 
 /// A timelocked config change proposal.
@@ -2847,6 +2890,72 @@ fn clear_global_votes(env: &Env, config: &MultisigAdmins) {
             .persistent()
             .remove(&constants::storage::global_resume_vote(&admin));
     }
+}
+
+// ============================================================================
+// Timelocked contract upgrade — helpers
+// ============================================================================
+
+/// Rejects a timelocked upgrade while the protocol is frozen.
+///
+/// Both freeze primitives are honoured: the single-admin `pause` and the 2-of-N
+/// `global_pause`. The upgrade path is the most dangerous state transition the
+/// contract has, so it must not be the one operation a freeze fails to cover.
+fn assert_upgrade_not_frozen(env: &Env) -> Result<(), ContractError> {
+    if is_paused(env) || is_global_trading_paused(env) {
+        return Err(ContractError::ContractFrozen);
+    }
+    Ok(())
+}
+
+/// Decodes the 32-byte WASM hash carried in a `TimelockChangeType::Upgrade`
+/// payload.
+///
+/// The length is checked before decoding so a malformed payload is rejected
+/// outright rather than being truncated into a valid-looking hash. Both steps
+/// return a typed error, so a hostile proposer can never abort the contract by
+/// way of its payload.
+fn decode_upgrade_payload(payload: &Bytes) -> Result<BytesN<32>, ContractError> {
+    if payload.len() != 32 {
+        return Err(ContractError::InvalidUpgradePayload);
+    }
+    BytesN::<32>::try_from(payload).map_err(|_| ContractError::InvalidUpgradePayload)
+}
+
+/// Counts distinct members of `config` who have approved the upgrade `action_id`.
+fn count_upgrade_approvals(env: &Env, config: &MultisigAdmins, action_id: u32) -> u32 {
+    let mut count = 0u32;
+    for admin in config.admins.iter() {
+        let key = constants::storage::upgrade_approval_vote(&admin, action_id);
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&key)
+            .unwrap_or(false)
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Clears every approval recorded against `action_id` so a completed or cancelled
+/// upgrade can never inherit stale votes.
+fn clear_upgrade_approvals(env: &Env, config: &MultisigAdmins, action_id: u32) {
+    for admin in config.admins.iter() {
+        env.storage()
+            .persistent()
+            .remove(&constants::storage::upgrade_approval_vote(
+                &admin, action_id,
+            ));
+    }
+}
+
+/// The logic (WASM) build currently in effect, once one has been recorded.
+fn read_logic_address(env: &Env) -> Option<BytesN<32>> {
+    env.storage()
+        .persistent()
+        .get(&constants::storage::LAST_APPLIED_WASM)
 }
 
 fn is_blacklisted(env: &Env, wallet: &Address) -> bool {
@@ -6160,16 +6269,7 @@ impl CreatorKeysContract {
         Ok(profile.supply)
     }
 
-    /// Purchase multiple keys in a single transaction.
-    ///
-    /// The buyer pays `payment` (total across all keys) and receives `quantity`
-    /// keys. Each key is priced along the bonding curve (or at the auction
-    /// price when in auction phase), and all per-key side-effects (fees,
-    /// dividends, TTL extension, events) are applied per key.
-    ///
-    /// # Limits
-    ///
-    /// Validates that `client_schema_version` is compatible with this deployment.
+    /// Checks that a client's schema version is compatible with this deployment.
     ///
     /// Returns `Ok(())` when the version matches the contract's current schema.
     /// Returns an error when the client is too old or too new:
@@ -6950,32 +7050,161 @@ impl CreatorKeysContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Upgrades the contract WASM to `new_wasm_hash` and increments the version.
+    /// Stages a timelocked upgrade of the contract's logic build and returns the
+    /// action id that will carry it out.
     ///
-    /// Only the protocol admin may call this. Emits an `UpgradeExecuted` event
-    /// carrying the old and new version.
+    /// This is the only entrypoint that can change the live logic. It no longer
+    /// applies a swap on the spot: calling it only *proposes* one. The swap
+    /// itself happens in [`execute_action`], and only once **all three** gates
+    /// have cleared:
+    ///
+    /// 1. the timelock delay has elapsed ([`get_timelock_delay`]);
+    /// 2. at least [`GLOBAL_PAUSE_THRESHOLD`] distinct members of the multi-sig
+    ///    admin set have called [`approve_upgrade`];
+    /// 3. the protocol is not frozen ([`pause`] or [`global_pause`] inactive).
+    ///
+    /// Only the protocol admin may call this. A queued upgrade can be abandoned
+    /// with [`cancel_action`] until it executes.
+    ///
+    /// # Why a code swap and not a forwarding proxy
+    ///
+    /// An EVM-style proxy keeps the address fixed and `delegatecall`s into a
+    /// separately deployed logic contract. Soroban has no `delegatecall`, and
+    /// emulating it with `invoke_contract` would be strictly worse here: the
+    /// proxy's own storage would start empty, so every holder, balance, fee
+    /// accumulator and timelock record would have to be migrated out of the
+    /// already-deployed contract by hand.
+    ///
+    /// [`update_current_contract_wasm`](soroban_sdk::Env::update_current_contract_wasm)
+    /// is the platform's native equivalent and is what this uses. It rebinds the
+    /// code at the *same contract address*, and storage is keyed to that address
+    /// rather than to the code, so every entry survives untouched — no migration,
+    /// no re-registration for callers, and the contract id baked into existing
+    /// integrations keeps working. That is the state-preservation guarantee the
+    /// proxy pattern is meant to provide, obtained without the proxy's costs.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::Unauthorized`] if `admin` is not the protocol admin.
+    /// - [`ContractError::ContractFrozen`] if the protocol is frozen.
+    /// - [`ContractError::Overflow`] on arithmetic overflow.
     pub fn upgrade(
         env: Env,
         admin: Address,
         new_wasm_hash: BytesN<32>,
-    ) -> Result<(), ContractError> {
+    ) -> Result<u32, ContractError> {
         admin.require_auth();
         assert_is_admin(&env, &admin)?;
-        let old_version = Self::get_version(env.clone());
-        let new_version = old_version.checked_add(1).ok_or(ContractError::Overflow)?;
-        env.storage()
+        assert_upgrade_not_frozen(&env)?;
+
+        Self::schedule_timelocked_action(
+            &env,
+            &admin,
+            TimelockChangeType::Upgrade,
+            new_wasm_hash.into(),
+        )
+    }
+
+    /// Records a multi-sig approval for the pending upgrade `action_id`.
+    ///
+    /// Callable by any member of the multi-sig admin set configured through
+    /// [`set_global_pause_admins`]. The first approval is only recorded; the
+    /// upgrade becomes executable once [`GLOBAL_PAUSE_THRESHOLD`] distinct admins
+    /// have approved. A single admin can never satisfy the gate alone.
+    ///
+    /// Approvals are bound to the action id and cleared once the action executes
+    /// or is cancelled, so they can never leak onto a later proposal.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::Unauthorized`] if no admin set is configured, or
+    ///   `caller` is not a member of it.
+    /// - [`ContractError::ProposalNotFound`] if `action_id` does not exist.
+    /// - [`ContractError::ActionNotPending`] if the action was already executed
+    ///   or cancelled.
+    /// - [`ContractError::InvalidChangeType`] if the action is not an upgrade.
+    /// - [`ContractError::AlreadyApproved`] if `caller` already approved.
+    pub fn approve_upgrade(env: Env, caller: Address, action_id: u32) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let config = read_global_pause_admins(&env)?;
+        assert_global_pause_admin(&config, &caller)?;
+
+        let action_key = constants::storage::action_proposal(action_id);
+        let action: TimelockAction = env
+            .storage()
             .persistent()
-            .set(&constants::storage::CONTRACT_VERSION, &new_version);
-        extend_key_ttl_to_full_window(&env, &constants::storage::CONTRACT_VERSION);
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+            .get(&action_key)
+            .ok_or(ContractError::ProposalNotFound)?;
+        if action.executed || action.cancelled {
+            return Err(ContractError::ActionNotPending);
+        }
+        if action.change_type != TimelockChangeType::Upgrade {
+            return Err(ContractError::InvalidChangeType);
+        }
+
+        let vote_key = constants::storage::upgrade_approval_vote(&caller, action_id);
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&vote_key)
+            .unwrap_or(false)
+        {
+            return Err(ContractError::AlreadyApproved);
+        }
+        env.storage().persistent().set(&vote_key, &true);
+
+        let approvals = count_upgrade_approvals(&env, &config, action_id);
         env.events().publish(
-            events::upgrade_executed_topics(&admin),
-            events::UpgradeExecutedEvent {
-                old_version,
-                new_version,
+            events::upgrade_approved_topics(action_id),
+            events::UpgradeApprovedEvent {
+                action_id,
+                admin: caller,
+                approvals,
+                threshold: GLOBAL_PAUSE_THRESHOLD,
+                approved_at: env.ledger().timestamp(),
             },
         );
+
         Ok(())
+    }
+
+    /// Read-only view: the number of distinct multi-sig approvals recorded for
+    /// the upgrade `action_id`.
+    pub fn get_upgrade_approvals(env: Env, action_id: u32) -> u32 {
+        match read_global_pause_admins(&env) {
+            Ok(config) => count_upgrade_approvals(&env, &config, action_id),
+            Err(_) => 0,
+        }
+    }
+
+    /// Read-only view: the logic (WASM) build currently in effect.
+    ///
+    /// Returns `None` until the first timelocked upgrade has been applied.
+    pub fn get_logic_address(env: Env) -> Option<BytesN<32>> {
+        read_logic_address(&env)
+    }
+
+    /// Read-only view: the logic (WASM) hash staged for the next upgrade.
+    ///
+    /// Cleared once the upgrade executes or its action is cancelled.
+    pub fn get_upgrade_target(env: Env) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&constants::storage::PENDING_UPGRADE_WASM)
+    }
+
+    /// Read-only view: the logic (WASM) build in effect before the most recent
+    /// upgrade.
+    ///
+    /// Retained so an incident can be reversed by proposing a fresh timelocked
+    /// upgrade back to this hash — there is deliberately no ungated rollback
+    /// entrypoint, so a downgrade is audited and delayed like any other change.
+    /// `None` until a second upgrade has been applied.
+    pub fn get_previous_wasm(env: Env) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&constants::storage::PREVIOUS_WASM)
     }
 
     /// Read-only view: returns the current contract upgrade version (starts at 1).
@@ -13874,6 +14103,21 @@ impl CreatorKeysContract {
         admin.require_auth();
         assert_is_admin(&env, &admin)?;
 
+        Self::schedule_timelocked_action(&env, &admin, change_type, payload)
+    }
+
+    /// Creates and persists a timelocked action, stamping it with the currently
+    /// configured delay.
+    ///
+    /// Shared by [`propose_action`] and [`upgrade`] so both paths produce an
+    /// identical action record, event and id sequence — there is no way to
+    /// queue an action that bypasses the timelock.
+    fn schedule_timelocked_action(
+        env: &Env,
+        proposer: &Address,
+        change_type: TimelockChangeType,
+        payload: soroban_sdk::Bytes,
+    ) -> Result<u32, ContractError> {
         let action_id: u32 = env
             .storage()
             .persistent()
@@ -13886,13 +14130,23 @@ impl CreatorKeysContract {
             .checked_add(Self::get_timelock_delay(env.clone()))
             .ok_or(ContractError::Overflow)?;
 
+        // An upgrade also stages its target hash so `get_upgrade_target` can be
+        // read without decoding the action payload. Staged before the action
+        // record is written, which consumes `payload`.
+        if change_type == TimelockChangeType::Upgrade {
+            env.storage()
+                .persistent()
+                .set(&constants::storage::PENDING_UPGRADE_WASM, &payload);
+            extend_key_ttl_to_full_window(env, &constants::storage::PENDING_UPGRADE_WASM);
+        }
+
         let action_key = constants::storage::action_proposal(action_id);
         env.storage().persistent().set(
             &action_key,
             &TimelockAction {
                 change_type,
                 payload,
-                proposer: admin.clone(),
+                proposer: proposer.clone(),
                 proposed_at,
                 execution_not_before,
                 executed: false,
@@ -13902,14 +14156,14 @@ impl CreatorKeysContract {
         env.storage()
             .persistent()
             .set(&constants::storage::ACTION_NEXT_ID, &next_id);
-        extend_key_ttl_to_full_window(&env, &action_key);
-        extend_key_ttl_to_full_window(&env, &constants::storage::ACTION_NEXT_ID);
+        extend_key_ttl_to_full_window(env, &action_key);
+        extend_key_ttl_to_full_window(env, &constants::storage::ACTION_NEXT_ID);
 
         env.events().publish(
             events::action_proposed_topics(action_id),
             events::ActionProposedEvent {
                 action_id,
-                proposer: admin,
+                proposer: proposer.clone(),
                 change_type: change_type as u32,
                 proposed_at,
                 execution_not_before,
@@ -13921,12 +14175,29 @@ impl CreatorKeysContract {
 
     /// Executes a proposed action once its execution timestamp has been reached.
     ///
+    /// A [`TimelockChangeType::Upgrade`] action swaps the contract's logic to the
+    /// WASM named in its payload. It clears two gates beyond the elapsed delay:
+    /// [`GLOBAL_PAUSE_THRESHOLD`] distinct multi-sig approvals (see
+    /// [`approve_upgrade`]) and an unfrozen protocol. See
+    /// [`apply_timelocked_upgrade`].
+    ///
+    /// The remaining change types ([`TimelockChangeType::Fee`],
+    /// [`TimelockChangeType::CurveExponent`], [`TimelockChangeType::Treasury`])
+    /// are recorded and retired here but apply no configuration change: their
+    /// payload is not interpreted. The direct setters remain the only way to
+    /// change fee, curve or treasury.
+    ///
     /// # Errors
     ///
     /// - [`ContractError::Unauthorized`] if `admin` is not the protocol admin.
     /// - [`ContractError::ProposalNotFound`] if `action_id` does not exist.
     /// - [`ContractError::ActionNotPending`] if the action was already executed or cancelled.
     /// - [`ContractError::TimelockNotElapsed`] if the delay has not yet elapsed.
+    /// - [`ContractError::UpgradeApprovalThresholdNotMet`] if an upgrade has too
+    ///   few multi-sig approvals.
+    /// - [`ContractError::ContractFrozen`] if an upgrade is attempted while frozen.
+    /// - [`ContractError::InvalidUpgradePayload`] if the upgrade payload is not a
+    ///   32-byte WASM hash.
     pub fn execute_action(env: Env, admin: Address, action_id: u32) -> Result<(), ContractError> {
         admin.require_auth();
         assert_is_admin(&env, &admin)?;
@@ -13946,6 +14217,13 @@ impl CreatorKeysContract {
             return Err(ContractError::TimelockNotElapsed);
         }
 
+        // Swap the logic before the action is flagged executed, so a rejected
+        // upgrade leaves the action pending and re-executable once the blocker
+        // clears.
+        if action.change_type == TimelockChangeType::Upgrade {
+            Self::apply_timelocked_upgrade(&env, &action, action_id, &admin, now)?;
+        }
+
         action.executed = true;
         env.storage().persistent().set(&action_key, &action);
         extend_key_ttl_to_full_window(&env, &action_key);
@@ -13954,6 +14232,85 @@ impl CreatorKeysContract {
             events::action_executed_topics(action_id),
             events::ActionExecutedEvent {
                 action_id,
+                executed_at: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Applies a timelocked logic upgrade: swaps the contract's WASM and records
+    /// the resulting version.
+    ///
+    /// Runs *before* the action is flagged executed so a rejected upgrade leaves
+    /// the action pending and re-executable once the blocker clears.
+    ///
+    /// Gate order is cheapest-check-first, and every gate is re-verified here
+    /// rather than trusted from proposal time, because a proposal may sit in the
+    /// timelock window for days across admin-set and freeze-state changes.
+    fn apply_timelocked_upgrade(
+        env: &Env,
+        action: &TimelockAction,
+        action_id: u32,
+        admin: &Address,
+        now: u64,
+    ) -> Result<(), ContractError> {
+        let new_wasm_hash = decode_upgrade_payload(&action.payload)?;
+
+        let config = read_global_pause_admins(env)?;
+        if count_upgrade_approvals(env, &config, action_id) < GLOBAL_PAUSE_THRESHOLD {
+            return Err(ContractError::UpgradeApprovalThresholdNotMet);
+        }
+
+        assert_upgrade_not_frozen(env)?;
+
+        let old_wasm_hash = read_logic_address(env);
+        let old_version = Self::get_version(env.clone());
+        let new_version = old_version.checked_add(1).ok_or(ContractError::Overflow)?;
+
+        env.storage()
+            .persistent()
+            .set(&constants::storage::CONTRACT_VERSION, &new_version);
+        extend_key_ttl_to_full_window(env, &constants::storage::CONTRACT_VERSION);
+
+        // Retain the outgoing build so an incident can be reversed by proposing a
+        // fresh timelocked upgrade back to it.
+        if let Some(previous) = old_wasm_hash.clone() {
+            env.storage()
+                .persistent()
+                .set(&constants::storage::PREVIOUS_WASM, &previous);
+            extend_key_ttl_to_full_window(env, &constants::storage::PREVIOUS_WASM);
+        }
+        env.storage()
+            .persistent()
+            .set(&constants::storage::LAST_APPLIED_WASM, &new_wasm_hash);
+        extend_key_ttl_to_full_window(env, &constants::storage::LAST_APPLIED_WASM);
+
+        env.storage()
+            .persistent()
+            .remove(&constants::storage::PENDING_UPGRADE_WASM);
+        clear_upgrade_approvals(env, &config, action_id);
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Emitted alongside the legacy `UpgradeExecutedEvent` so indexers
+        // tracking either event keep working.
+        env.events().publish(
+            events::upgrade_executed_topics(admin),
+            events::UpgradeExecutedEvent {
+                old_version,
+                new_version,
+            },
+        );
+        env.events().publish(
+            events::logic_upgraded_topics(action_id),
+            events::LogicUpgradedEvent {
+                action_id,
+                old_wasm_hash,
+                new_wasm_hash,
+                old_version,
+                new_version,
                 executed_at: now,
             },
         );
@@ -13985,6 +14342,17 @@ impl CreatorKeysContract {
         action.cancelled = true;
         env.storage().persistent().set(&action_key, &action);
         extend_key_ttl_to_full_window(&env, &action_key);
+
+        // A cancelled upgrade must not leave its target staged or its approvals
+        // counted, otherwise a later proposal could inherit them.
+        if action.change_type == TimelockChangeType::Upgrade {
+            env.storage()
+                .persistent()
+                .remove(&constants::storage::PENDING_UPGRADE_WASM);
+            if let Ok(config) = read_global_pause_admins(&env) {
+                clear_upgrade_approvals(&env, &config, action_id);
+            }
+        }
 
         env.events().publish(
             events::action_cancelled_topics(action_id),
@@ -18215,6 +18583,12 @@ mod test_staking_lifecycle;
 
 #[cfg(test)]
 mod test_issues_904_905_906_908;
+
+#[cfg(test)]
+mod test_issues_924;
+
+#[cfg(test)]
+mod test_timelocked_upgrade;
 
 #[cfg(test)]
 mod test_unique_traders;
