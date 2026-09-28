@@ -1346,11 +1346,19 @@ pub const HANDLE_LEN_MAX: u32 = 32;
 /// Maximum byte-length of the `name` field in [`KeyMetadata`].
 pub const METADATA_NAME_MAX_LEN: u32 = 64;
 
-/// Maximum byte-length of the `bio` field in [`KeyMetadata`].
-pub const METADATA_BIO_MAX_LEN: u32 = 256;
+/// Maximum byte-length of the `symbol` field in [`KeyMetadata`].
+pub const METADATA_SYMBOL_MAX_LEN: u32 = 12;
 
-/// Maximum byte-length of the `avatar_uri` field in [`KeyMetadata`].
-pub const METADATA_AVATAR_URI_MAX_LEN: u32 = 256;
+/// Maximum byte-length of the `description` field in [`KeyMetadata`].
+pub const METADATA_DESCRIPTION_MAX_LEN: u32 = 256;
+
+/// Maximum byte-length of the `image_cid` field in [`KeyMetadata`].
+pub const METADATA_IMAGE_CID_MAX_LEN: u32 = 256;
+
+/// Backward-compatible alias for [`METADATA_DESCRIPTION_MAX_LEN`].
+pub const METADATA_BIO_MAX_LEN: u32 = METADATA_DESCRIPTION_MAX_LEN;
+/// Backward-compatible alias for [`METADATA_IMAGE_CID_MAX_LEN`].
+pub const METADATA_AVATAR_URI_MAX_LEN: u32 = METADATA_IMAGE_CID_MAX_LEN;
 pub const MAX_WHITELIST_SIZE: u32 = 500;
 
 /// Maximum number of recipient entries accepted by a single
@@ -2210,19 +2218,15 @@ pub struct ClaimResult {
     pub amount_claimed: i128,
 }
 
-/// Metadata associated with a creator key that can be set at initialisation
-/// and updated later via [`update_metadata`].
-///
-/// Only fields wrapped in `Some` are updated; `None` fields are left unchanged.
-/// Byte-length limits mirror the handle validation enforced by
-/// [`validate_creator_handle`] for `name` and use dedicated caps for `bio`
-/// and `avatar_uri`.
+/// Metadata associated with a creator key. Name and symbol are immutable after
+/// initialization; description and image CID can be changed by the creator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct KeyMetadata {
     pub name: String,
-    pub bio: String,
-    pub avatar_uri: String,
+    pub symbol: String,
+    pub description: String,
+    pub image_cid: String,
 }
 
 /// One recipient of a creator key airdrop: the wallet to credit and how many
@@ -2584,12 +2588,16 @@ fn is_valid_handle_byte(byte: u8) -> bool {
 pub fn read_creator_metadata(env: &Env, creator: &Address) -> Option<KeyMetadata> {
     use soroban_sdk::symbol_short;
     let key = (symbol_short!("md"), creator.clone());
-    env.storage().persistent().get(&key)
+    let metadata = env.storage().persistent().get(&key);
+    if metadata.is_some() {
+        extend_key_ttl_to_full_window(env, &key);
+    }
+    metadata
 }
 
 /// Validates the byte-length of a metadata string field.
 ///
-/// Returns [`ContractError::HandleTooLong`] when `value.len()` exceeds `max_len`.
+/// Returns `error` when `value.len()` exceeds `max_len`.
 fn assert_metadata_field_length(
     value: &String,
     max_len: u32,
@@ -2603,11 +2611,9 @@ fn assert_metadata_field_length(
 
 /// Validates a complete [`KeyMetadata`] payload.
 ///
-/// Rejects an empty `name` (blank or whitespace-only) with
-/// [`ContractError::DisplayNameEmpty`] and enforces per-field byte-length
-/// limits consistent with the handle rules used at registration.
+/// Rejects empty `name` and `symbol`, and enforces per-field byte-length limits.
 fn validate_key_metadata(metadata: &KeyMetadata) -> Result<(), ContractError> {
-    if metadata.name.is_empty() {
+    if metadata.name.is_empty() || metadata.symbol.is_empty() {
         return Err(ContractError::DisplayNameEmpty);
     }
     assert_metadata_field_length(
@@ -2616,14 +2622,19 @@ fn validate_key_metadata(metadata: &KeyMetadata) -> Result<(), ContractError> {
         ContractError::NameTooLong,
     )?;
     assert_metadata_field_length(
-        &metadata.bio,
-        METADATA_BIO_MAX_LEN,
+        &metadata.symbol,
+        METADATA_SYMBOL_MAX_LEN,
+        ContractError::NameTooLong,
+    )?;
+    assert_metadata_field_length(
+        &metadata.description,
+        METADATA_DESCRIPTION_MAX_LEN,
         ContractError::BioTooLong,
     )?;
     assert_metadata_field_length(
-        &metadata.avatar_uri,
-        METADATA_AVATAR_URI_MAX_LEN,
-        ContractError::NameTooLong,
+        &metadata.image_cid,
+        METADATA_IMAGE_CID_MAX_LEN,
+        ContractError::BioTooLong,
     )?;
     Ok(())
 }
@@ -2633,6 +2644,7 @@ fn write_creator_metadata(env: &Env, creator: &Address, metadata: &KeyMetadata) 
     use soroban_sdk::symbol_short;
     let key = (symbol_short!("md"), creator.clone());
     env.storage().persistent().set(&key, metadata);
+    extend_key_ttl_to_full_window(env, &key);
 }
 
 /// Validates a creator's display handle.
@@ -3804,6 +3816,13 @@ pub(crate) fn extend_creator_ttl(env: &Env, creator: &Address) {
     env.storage()
         .persistent()
         .extend_ttl(&creator_key, threshold, extend_to);
+
+    let metadata_key = (soroban_sdk::symbol_short!("md"), creator.clone());
+    if env.storage().persistent().has(&metadata_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&metadata_key, threshold, extend_to);
+    }
 
     let fee_balance_key = constants::storage::creator_fee_balance(creator);
     if env.storage().persistent().has(&fee_balance_key) {
@@ -8086,19 +8105,20 @@ impl CreatorKeysContract {
             .get(&constants::storage::auction_config(&creator))
     }
 
-    /// Stores on-chain identity metadata (name, bio, avatar URI) for a
+    /// Stores on-chain identity metadata (name, symbol, description, image CID) for a
     /// registered creator's key (issue #779).
     ///
-    /// Callable only by the creator themselves, once. To change metadata
-    /// afterwards, see the immutability note on [`ContractError::KeyAlreadyInitialised`] —
-    /// this contract has no `update_key_metadata` entrypoint; adding one is a
-    /// natural follow-up but out of scope for this issue.
+    /// Callable only by the creator themselves, once, for keys registered
+    /// without metadata. Creator-managed changes to description and image CID
+    /// are available through [`update_metadata`].
     ///
     /// # Errors
     /// - [`ContractError::NotRegistered`] if `creator` has no profile.
-    /// - [`ContractError::DisplayNameEmpty`] if `name` or `bio` is empty.
+    /// - [`ContractError::DisplayNameEmpty`] if `name` or `symbol` is empty.
     /// - [`ContractError::NameTooLong`] if `name` exceeds 64 bytes.
-    /// - [`ContractError::BioTooLong`] if `bio` exceeds 256 bytes.
+    /// - [`ContractError::NameTooLong`] if `symbol` exceeds 12 bytes.
+    /// - [`ContractError::BioTooLong`] if `description` or `image_cid` exceeds
+    ///   256 bytes.
     /// - [`ContractError::KeyAlreadyInitialised`] if metadata already exists
     ///   for `creator`.
     pub fn initialise_key(
@@ -8122,8 +8142,11 @@ impl CreatorKeysContract {
             events::KeyInitialisedEvent {
                 creator_id: creator,
                 name: metadata.name,
-                bio: metadata.bio,
-                avatar_uri: metadata.avatar_uri,
+                bio: metadata.description.clone(),
+                avatar_uri: metadata.image_cid.clone(),
+                symbol: metadata.symbol,
+                description: metadata.description,
+                image_cid: metadata.image_cid,
             },
         );
 
@@ -8131,9 +8154,14 @@ impl CreatorKeysContract {
     }
 
     /// Read-only view: returns a creator's on-chain key metadata, or `None`
-    /// if `initialise_key` has not been called for them.
+    /// if metadata has not been initialized for them.
     pub fn get_key_metadata(env: Env, creator: Address) -> Option<KeyMetadata> {
         read_creator_metadata(&env, &creator)
+    }
+
+    /// Read-only view: returns a key's complete on-chain metadata.
+    pub fn get_metadata(env: Env, key_id: Address) -> Option<KeyMetadata> {
+        read_creator_metadata(&env, &key_id)
     }
 
     /// Registers a creator key on their behalf with its full initial config:
@@ -8243,63 +8271,62 @@ impl CreatorKeysContract {
             .unwrap_or(false)
     }
 
-    /// Updates a creator's key metadata. Only fields wrapped in `Some` are
-    /// changed; `None` fields remain untouched. Emits `MetadataUpdated`.
+    /// Updates a creator's description and image CID. Name and symbol are
+    /// immutable after key initialization. Only the creator may update them.
     pub fn update_metadata(
         env: Env,
-        creator: Address,
-        name: Option<String>,
-        bio: Option<String>,
-        avatar_uri: Option<String>,
+        key_id: Address,
+        description: String,
+        image_cid: String,
     ) -> Result<(), ContractError> {
-        creator.require_auth();
+        key_id.require_auth();
         let mut metadata =
-            read_creator_metadata(&env, &creator).ok_or(ContractError::NotRegistered)?;
+            read_creator_metadata(&env, &key_id).ok_or(ContractError::NotRegistered)?;
 
-        let mut changed = false;
-        let mut updated_name = String::from_str(&env, "");
-        let mut updated_bio = String::from_str(&env, "");
-        let mut updated_avatar = String::from_str(&env, "");
+        assert_metadata_field_length(
+            &description,
+            METADATA_DESCRIPTION_MAX_LEN,
+            ContractError::BioTooLong,
+        )?;
+        assert_metadata_field_length(
+            &image_cid,
+            METADATA_IMAGE_CID_MAX_LEN,
+            ContractError::BioTooLong,
+        )?;
 
-        if let Some(n) = name {
-            if n.len() > METADATA_NAME_MAX_LEN {
-                return Err(ContractError::HandleTooLong);
-            }
-            updated_name = n.clone();
-            metadata.name = n;
-            changed = true;
-        }
-        if let Some(b) = bio {
-            if b.len() > METADATA_BIO_MAX_LEN {
-                return Err(ContractError::HandleTooLong);
-            }
-            updated_bio = b.clone();
-            metadata.bio = b;
-            changed = true;
-        }
-        if let Some(u) = avatar_uri {
-            if u.len() > METADATA_AVATAR_URI_MAX_LEN {
-                return Err(ContractError::HandleTooLong);
-            }
-            updated_avatar = u.clone();
-            metadata.avatar_uri = u;
-            changed = true;
-        }
+        let updated_description = if metadata.description != description {
+            metadata.description = description.clone();
+            Some(description)
+        } else {
+            None
+        };
+        let updated_image_cid = if metadata.image_cid != image_cid {
+            metadata.image_cid = image_cid.clone();
+            Some(image_cid)
+        } else {
+            None
+        };
 
-        if !changed {
+        if updated_description.is_none() && updated_image_cid.is_none() {
             return Ok(());
         }
 
-        write_creator_metadata(&env, &creator, &metadata);
+        write_creator_metadata(&env, &key_id, &metadata);
 
         env.events().publish(
-            events::metadata_updated_topics(&creator),
+            events::metadata_updated_topics(&key_id),
             events::MetadataUpdatedEvent {
-                creator_id: creator.clone(),
-                name: updated_name,
-                bio: updated_bio,
-                avatar_uri: updated_avatar,
+                creator_id: key_id,
+                name: String::from_str(&env, ""),
+                bio: updated_description
+                    .clone()
+                    .unwrap_or(String::from_str(&env, "")),
+                avatar_uri: updated_image_cid
+                    .clone()
+                    .unwrap_or(String::from_str(&env, "")),
                 ledger: env.ledger().sequence(),
+                description: updated_description,
+                image_cid: updated_image_cid,
             },
         );
 
