@@ -264,7 +264,10 @@ fn test_whitelist_updated_events_emitted_on_add_and_remove() {
             _ => false,
         }
     });
-    assert!(has_wallet1_added, "Expected WhitelistUpdatedEvent for wallet1 add");
+    assert!(
+        has_wallet1_added,
+        "Expected WhitelistUpdatedEvent for wallet1 add"
+    );
 
     // Verify WhitelistUpdatedEvent for wallet2 (allowed: true)
     let has_wallet2_added = all_events.iter().any(|e| {
@@ -285,7 +288,10 @@ fn test_whitelist_updated_events_emitted_on_add_and_remove() {
             _ => false,
         }
     });
-    assert!(has_wallet2_added, "Expected WhitelistUpdatedEvent for wallet2 add");
+    assert!(
+        has_wallet2_added,
+        "Expected WhitelistUpdatedEvent for wallet2 add"
+    );
 
     // Remove wallet1
     client.remove_from_whitelist(&creator, &wallet1);
@@ -309,7 +315,10 @@ fn test_whitelist_updated_events_emitted_on_add_and_remove() {
             _ => false,
         }
     });
-    assert!(has_wallet1_removed, "Expected WhitelistUpdatedEvent for wallet1 remove");
+    assert!(
+        has_wallet1_removed,
+        "Expected WhitelistUpdatedEvent for wallet1 remove"
+    );
 }
 
 #[test]
