@@ -43,7 +43,8 @@ use crate::{
     CreatorKeysContract, CreatorKeysContractArgs, CreatorKeysContractClient, VaultAllocation,
 };
 use soroban_sdk::{
-    contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
+    contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol,
+    Vec,
 };
 
 /// Event name for protocol trade fee collected on a buy or sell.
@@ -2651,6 +2652,75 @@ pub fn action_cancelled_topics(action_id: u32) -> (Symbol, u32) {
 }
 
 // ============================================================================
+// Feature: timelocked contract upgrade — LogicUpgraded / UpgradeApproved
+// ============================================================================
+
+/// Event name emitted when a timelocked upgrade swaps the contract's logic build.
+///
+/// Emitted alongside (never instead of) `UpgradeExecutedEvent`, so indexers
+/// already tracking the legacy `upgraded` event keep working unchanged.
+pub const LOGIC_UPGRADED_EVENT_NAME: Symbol = symbol_short!("logic_upg");
+
+/// Stable payload describing a completed timelocked logic upgrade.
+///
+/// Carries both the outgoing and incoming logic identity, which is the whole
+/// point of the event: an operator can diff the pair to confirm which build is
+/// live and, if it misbehaved, which build to propose a rollback to.
+///
+/// Event shape:
+/// - topics: `(LOGIC_UPGRADED_EVENT_NAME, action_id)`
+/// - data: `LogicUpgradedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct LogicUpgradedEvent {
+    /// Timelocked action that carried out the swap.
+    pub action_id: u32,
+    /// Logic (WASM) hash in effect before the upgrade. `None` on the first
+    /// recorded upgrade, when no prior hash has been retained yet.
+    pub old_wasm_hash: Option<BytesN<32>>,
+    /// Logic (WASM) hash now in effect.
+    pub new_wasm_hash: BytesN<32>,
+    pub old_version: u32,
+    pub new_version: u32,
+    /// Ledger timestamp (seconds) at which the swap was applied.
+    pub executed_at: u64,
+}
+
+/// Shared logic-upgraded event topics tuple.
+pub fn logic_upgraded_topics(action_id: u32) -> (Symbol, u32) {
+    (LOGIC_UPGRADED_EVENT_NAME, action_id)
+}
+
+/// Event name emitted when one member of the multi-sig admin set approves a
+/// pending timelocked upgrade.
+pub const UPGRADE_APPROVED_EVENT_NAME: Symbol = symbol_short!("upg_appr");
+
+/// Stable payload for a single multi-sig approval of a pending upgrade.
+///
+/// Event shape:
+/// - topics: `(UPGRADE_APPROVED_EVENT_NAME, action_id)`
+/// - data: `UpgradeApprovedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct UpgradeApprovedEvent {
+    /// Timelocked action being approved.
+    pub action_id: u32,
+    /// Admin that cast this approval.
+    pub admin: Address,
+    /// Total distinct approvals recorded so far, including this one.
+    pub approvals: u32,
+    /// Distinct approvals required before the upgrade may execute.
+    pub threshold: u32,
+    /// Ledger timestamp (seconds) of the approval.
+    pub approved_at: u64,
+}
+
+/// Shared upgrade-approved event topics tuple.
+pub fn upgrade_approved_topics(action_id: u32) -> (Symbol, u32) {
+    (UPGRADE_APPROVED_EVENT_NAME, action_id)
+}
+
+// ============================================================================
 // Feature: holder_count tracking — HolderCountChanged event
 // ============================================================================
 
@@ -3197,6 +3267,110 @@ pub struct LeaderboardConfigUpdatedEvent {
 /// Shared leaderboard-config-updated event topics tuple.
 pub fn leaderboard_config_updated_topics(admin: &Address) -> (Symbol, Address) {
     (LEADERBOARD_CONFIG_UPDATED_EVENT_NAME, admin.clone())
+}
+
+// --- Emergency platform pause events (#1000) ---
+
+/// Event name emitted when the platform-wide emergency halt activates.
+pub const PLATFORM_PAUSED_EVENT_NAME: Symbol = symbol_short!("plat_pau");
+
+/// Event name emitted when a platform resume is queued behind the 24h timelock.
+pub const PLATFORM_RESUME_QUEUED_EVENT_NAME: Symbol = symbol_short!("plat_rq");
+
+/// Event name emitted when the platform-wide emergency halt is lifted.
+pub const PLATFORM_RESUMED_EVENT_NAME: Symbol = symbol_short!("plat_res");
+
+/// Event name emitted when a per-key emergency pause override is set or cleared.
+pub const KEY_PAUSE_OVERRIDE_EVENT_NAME: Symbol = symbol_short!("key_pau");
+
+/// Stable field order for [`PlatformPausedEvent`].
+pub const PLATFORM_PAUSED_EVENT_DATA_FIELDS: [&str; 2] = ["actor", "timestamp"];
+
+/// Stable field order for [`PlatformResumeQueuedEvent`].
+pub const PLATFORM_RESUME_QUEUED_EVENT_DATA_FIELDS: [&str; 2] = ["actor", "executable_at"];
+
+/// Stable field order for [`PlatformResumedEvent`].
+pub const PLATFORM_RESUMED_EVENT_DATA_FIELDS: [&str; 2] = ["actor", "timestamp"];
+
+/// Stable field order for [`KeyPauseOverrideEvent`].
+pub const KEY_PAUSE_OVERRIDE_EVENT_DATA_FIELDS: [&str; 3] = ["key_id", "paused", "actor"];
+
+/// Stable platform-paused event payload.
+///
+/// Event shape:
+/// - topics: `(PLATFORM_PAUSED_EVENT_NAME, actor)`
+/// - data: `PlatformPausedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PlatformPausedEvent {
+    /// First signer of the multisig call.
+    pub actor: Address,
+    /// Ledger timestamp at which the halt took effect.
+    pub timestamp: u64,
+}
+
+/// Stable platform-resume-queued event payload.
+///
+/// Event shape:
+/// - topics: `(PLATFORM_RESUME_QUEUED_EVENT_NAME, actor)`
+/// - data: `PlatformResumeQueuedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PlatformResumeQueuedEvent {
+    /// First signer of the multisig call.
+    pub actor: Address,
+    /// Ledger timestamp from which `resume_platform` may execute.
+    pub executable_at: u64,
+}
+
+/// Stable platform-resumed event payload.
+///
+/// Event shape:
+/// - topics: `(PLATFORM_RESUMED_EVENT_NAME, actor)`
+/// - data: `PlatformResumedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PlatformResumedEvent {
+    /// First signer of the multisig call.
+    pub actor: Address,
+    /// Ledger timestamp at which the halt was lifted.
+    pub timestamp: u64,
+}
+
+/// Stable key-pause-override event payload.
+///
+/// Event shape:
+/// - topics: `(KEY_PAUSE_OVERRIDE_EVENT_NAME, key_id)`
+/// - data: `KeyPauseOverrideEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyPauseOverrideEvent {
+    /// Key whose override changed.
+    pub key_id: Address,
+    /// `true` when the key was paused, `false` when the override was cleared.
+    pub paused: bool,
+    /// First signer of the multisig call.
+    pub actor: Address,
+}
+
+/// Shared platform-paused event topics tuple.
+pub fn platform_paused_topics(actor: &Address) -> (Symbol, Address) {
+    (PLATFORM_PAUSED_EVENT_NAME, actor.clone())
+}
+
+/// Shared platform-resume-queued event topics tuple.
+pub fn platform_resume_queued_topics(actor: &Address) -> (Symbol, Address) {
+    (PLATFORM_RESUME_QUEUED_EVENT_NAME, actor.clone())
+}
+
+/// Shared platform-resumed event topics tuple.
+pub fn platform_resumed_topics(actor: &Address) -> (Symbol, Address) {
+    (PLATFORM_RESUMED_EVENT_NAME, actor.clone())
+}
+
+/// Shared key-pause-override event topics tuple.
+pub fn key_pause_override_topics(key_id: &Address) -> (Symbol, Address) {
+    (KEY_PAUSE_OVERRIDE_EVENT_NAME, key_id.clone())
 }
 
 // --- Vault rebalancing ---
