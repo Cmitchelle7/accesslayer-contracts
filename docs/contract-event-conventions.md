@@ -103,6 +103,17 @@ Notes for indexers:
 - Because the upgrade swaps code via `update_current_contract_wasm`, `logic_upg`
   is emitted by the **new** build at the same contract address; there is no
   separate logic-contract address to follow.
+### Emergency Platform Pause Events (#1000)
+
+| Event Name | Topics (Index 0, 1, 2) | Data Fields | Data Type |
+| :--- | :--- | :--- | :--- |
+| `plat_pau` | `(Symbol("plat_pau"), actor)` | `actor`, `timestamp` | `struct PlatformPausedEvent` |
+| `plat_rq` | `(Symbol("plat_rq"), actor)` | `actor`, `executable_at` | `struct PlatformResumeQueuedEvent` |
+| `plat_res` | `(Symbol("plat_res"), actor)` | `actor`, `timestamp` | `struct PlatformResumedEvent` |
+| `key_pau` | `(Symbol("key_pau"), key_id)` | `key_id`, `paused`, `actor` | `struct KeyPauseOverrideEvent` |
+
+`actor` is the first signer of the multisig call. `timestamp` and
+`executable_at` are ledger timestamps in seconds, not ledger sequence numbers.
 
 ## Data Type Inconsistency
 While the general preference is for `struct` payloads (like `register`), some high-frequency events like `buy` and `sell` use `tuples` for gas efficiency. Indexers should check the `contracttype` encoding to distinguish between map-based structs and array-based tuples.

@@ -3269,6 +3269,110 @@ pub fn leaderboard_config_updated_topics(admin: &Address) -> (Symbol, Address) {
     (LEADERBOARD_CONFIG_UPDATED_EVENT_NAME, admin.clone())
 }
 
+// --- Emergency platform pause events (#1000) ---
+
+/// Event name emitted when the platform-wide emergency halt activates.
+pub const PLATFORM_PAUSED_EVENT_NAME: Symbol = symbol_short!("plat_pau");
+
+/// Event name emitted when a platform resume is queued behind the 24h timelock.
+pub const PLATFORM_RESUME_QUEUED_EVENT_NAME: Symbol = symbol_short!("plat_rq");
+
+/// Event name emitted when the platform-wide emergency halt is lifted.
+pub const PLATFORM_RESUMED_EVENT_NAME: Symbol = symbol_short!("plat_res");
+
+/// Event name emitted when a per-key emergency pause override is set or cleared.
+pub const KEY_PAUSE_OVERRIDE_EVENT_NAME: Symbol = symbol_short!("key_pau");
+
+/// Stable field order for [`PlatformPausedEvent`].
+pub const PLATFORM_PAUSED_EVENT_DATA_FIELDS: [&str; 2] = ["actor", "timestamp"];
+
+/// Stable field order for [`PlatformResumeQueuedEvent`].
+pub const PLATFORM_RESUME_QUEUED_EVENT_DATA_FIELDS: [&str; 2] = ["actor", "executable_at"];
+
+/// Stable field order for [`PlatformResumedEvent`].
+pub const PLATFORM_RESUMED_EVENT_DATA_FIELDS: [&str; 2] = ["actor", "timestamp"];
+
+/// Stable field order for [`KeyPauseOverrideEvent`].
+pub const KEY_PAUSE_OVERRIDE_EVENT_DATA_FIELDS: [&str; 3] = ["key_id", "paused", "actor"];
+
+/// Stable platform-paused event payload.
+///
+/// Event shape:
+/// - topics: `(PLATFORM_PAUSED_EVENT_NAME, actor)`
+/// - data: `PlatformPausedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PlatformPausedEvent {
+    /// First signer of the multisig call.
+    pub actor: Address,
+    /// Ledger timestamp at which the halt took effect.
+    pub timestamp: u64,
+}
+
+/// Stable platform-resume-queued event payload.
+///
+/// Event shape:
+/// - topics: `(PLATFORM_RESUME_QUEUED_EVENT_NAME, actor)`
+/// - data: `PlatformResumeQueuedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PlatformResumeQueuedEvent {
+    /// First signer of the multisig call.
+    pub actor: Address,
+    /// Ledger timestamp from which `resume_platform` may execute.
+    pub executable_at: u64,
+}
+
+/// Stable platform-resumed event payload.
+///
+/// Event shape:
+/// - topics: `(PLATFORM_RESUMED_EVENT_NAME, actor)`
+/// - data: `PlatformResumedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PlatformResumedEvent {
+    /// First signer of the multisig call.
+    pub actor: Address,
+    /// Ledger timestamp at which the halt was lifted.
+    pub timestamp: u64,
+}
+
+/// Stable key-pause-override event payload.
+///
+/// Event shape:
+/// - topics: `(KEY_PAUSE_OVERRIDE_EVENT_NAME, key_id)`
+/// - data: `KeyPauseOverrideEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyPauseOverrideEvent {
+    /// Key whose override changed.
+    pub key_id: Address,
+    /// `true` when the key was paused, `false` when the override was cleared.
+    pub paused: bool,
+    /// First signer of the multisig call.
+    pub actor: Address,
+}
+
+/// Shared platform-paused event topics tuple.
+pub fn platform_paused_topics(actor: &Address) -> (Symbol, Address) {
+    (PLATFORM_PAUSED_EVENT_NAME, actor.clone())
+}
+
+/// Shared platform-resume-queued event topics tuple.
+pub fn platform_resume_queued_topics(actor: &Address) -> (Symbol, Address) {
+    (PLATFORM_RESUME_QUEUED_EVENT_NAME, actor.clone())
+}
+
+/// Shared platform-resumed event topics tuple.
+pub fn platform_resumed_topics(actor: &Address) -> (Symbol, Address) {
+    (PLATFORM_RESUMED_EVENT_NAME, actor.clone())
+}
+
+/// Shared key-pause-override event topics tuple.
+pub fn key_pause_override_topics(key_id: &Address) -> (Symbol, Address) {
+    (KEY_PAUSE_OVERRIDE_EVENT_NAME, key_id.clone())
+}
+
 // --- Vault rebalancing ---
 
 /// Event name for a completed vault rebalance.

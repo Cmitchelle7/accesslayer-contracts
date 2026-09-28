@@ -14,6 +14,7 @@ pub mod acl_limits_merge_sunset;
 /// declaration, so `subscribe_key_access` and `is_subscribed` compiled nowhere
 /// and could not be called.
 pub mod curve_subscriptions_swaps;
+pub mod emergency_pause;
 pub mod events;
 pub mod lp_reward;
 pub mod ratings_royalties_dividends;
@@ -5450,6 +5451,7 @@ impl CreatorKeysContract {
         referrer: Option<Address>,
     ) -> Result<u32, ContractError> {
         buyer.require_auth();
+        emergency_pause::assert_trading_allowed(&env, &creator)?;
         assert_global_trading_not_halted(&env)?;
         assert_key_trading_not_paused(&env, &creator)?;
         assert_not_paused(&env)?;
@@ -5859,6 +5861,7 @@ impl CreatorKeysContract {
         referrer: Option<Address>,
     ) -> Result<u32, ContractError> {
         buyer.require_auth();
+        emergency_pause::assert_trading_allowed(&env, &creator)?;
         assert_global_trading_not_halted(&env)?;
         assert_key_trading_not_paused(&env, &creator)?;
         assert_not_paused(&env)?;
@@ -6291,6 +6294,7 @@ impl CreatorKeysContract {
         min_proceeds: Option<i128>,
     ) -> Result<u32, ContractError> {
         seller.require_auth();
+        emergency_pause::assert_trading_allowed(&env, &creator)?;
         assert_global_trading_not_halted(&env)?;
         assert_key_trading_not_paused(&env, &creator)?;
         assert_not_paused(&env)?;
@@ -9048,6 +9052,7 @@ impl CreatorKeysContract {
 
         for order in orders.iter() {
             let (creator, quantity, max_price) = order;
+            emergency_pause::assert_trading_allowed(&env, &creator)?;
 
             if quantity == 0 {
                 return Err(ContractError::NotPositiveAmount);
@@ -11834,6 +11839,68 @@ impl CreatorKeysContract {
     }
 
     // =========================================================================
+    // #1000 — Emergency platform pause
+    // =========================================================================
+
+    /// Halts every bonding-curve buy and sell across all keys in one call.
+    ///
+    /// `signers` must hold at least two distinct members of the global-pause
+    /// admin set, each of whom must authorise the call. Emits `PlatformPaused`.
+    pub fn pause_platform(
+        env: Env,
+        signers: Vec<Address>,
+    ) -> Result<(), emergency_pause::EmergencyPauseError> {
+        emergency_pause::pause_platform(&env, &signers)
+    }
+
+    /// Queues a platform resume, executable after the 24h timelock. Same
+    /// multisig requirement as [`Self::pause_platform`]. Returns the timestamp
+    /// at which [`Self::resume_platform`] may be called.
+    pub fn queue_platform_resume(
+        env: Env,
+        signers: Vec<Address>,
+    ) -> Result<u64, emergency_pause::EmergencyPauseError> {
+        emergency_pause::queue_platform_resume(&env, &signers)
+    }
+
+    /// Lifts the platform halt once a queued resume's 24h timelock has elapsed.
+    /// Same multisig requirement as [`Self::pause_platform`]. Emits
+    /// `PlatformResumed`. Per-key overrides are left untouched.
+    pub fn resume_platform(
+        env: Env,
+        signers: Vec<Address>,
+    ) -> Result<(), emergency_pause::EmergencyPauseError> {
+        emergency_pause::resume_platform(&env, &signers)
+    }
+
+    /// Read-only view: whether the platform-wide emergency halt is active.
+    pub fn is_paused(env: Env) -> bool {
+        emergency_pause::is_platform_paused(&env)
+    }
+
+    /// Read-only view: the timestamp at which a queued resume becomes executable.
+    pub fn get_platform_resume_eta(env: Env) -> Option<u64> {
+        emergency_pause::resume_eta(&env)
+    }
+
+    /// Sets or clears the emergency pause override for a single key. Same
+    /// multisig requirement as [`Self::pause_platform`]; independent of the
+    /// platform halt.
+    pub fn set_key_pause_override(
+        env: Env,
+        signers: Vec<Address>,
+        key_id: Address,
+        paused: bool,
+    ) -> Result<(), emergency_pause::EmergencyPauseError> {
+        emergency_pause::set_key_pause_override(&env, &signers, &key_id, paused)
+    }
+
+    /// Read-only view: whether `key_id` has an active emergency pause override.
+    pub fn is_key_paused(env: Env, key_id: Address) -> bool {
+        emergency_pause::is_key_paused(&env, &key_id)
+    }
+
+    // =========================================================================
     // #763 — Vesting schedule
     // =========================================================================
 
@@ -12884,6 +12951,7 @@ impl CreatorKeysContract {
 
         for order in orders.iter() {
             let (creator, quantity) = order;
+            emergency_pause::assert_trading_allowed(&env, &creator)?;
             if quantity == 0 {
                 return Err(ContractError::NotPositiveAmount);
             }
@@ -13019,6 +13087,7 @@ impl CreatorKeysContract {
         // Validate each order and check that the caller holds sufficient liquid balance.
         for i in 0..orders.len() {
             let (creator, qty) = orders.get(i).unwrap();
+            emergency_pause::assert_trading_allowed(&env, &creator)?;
             if qty == 0 {
                 return Err(ContractError::NotPositiveAmount);
             }
@@ -18526,3 +18595,6 @@ mod test_unique_traders;
 
 #[cfg(test)]
 mod test_lp_reward;
+
+#[cfg(test)]
+mod test_issue_1000;
