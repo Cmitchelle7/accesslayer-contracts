@@ -6,8 +6,16 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Vec,
 };
 
+pub mod acl_dividend_twap_gov;
 pub mod acl_limits_merge_sunset;
+/// Bonding-curve migration, key subscriptions, and atomic swaps.
+///
+/// Declared here as part of Issue #953 — the file existed but had no `mod`
+/// declaration, so `subscribe_key_access` and `is_subscribed` compiled nowhere
+/// and could not be called.
+pub mod curve_subscriptions_swaps;
 pub mod events;
+pub mod lp_reward;
 pub mod ratings_royalties_dividends;
 
 pub mod test_feature_impl;
@@ -1204,6 +1212,19 @@ pub struct QuoteResponse {
     pub total_amount: i128,
 }
 
+/// Supply snapshot for a key, returned by [`CreatorKeysContract::get_supply_info`]
+/// (issue #997).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SupplyInfo {
+    /// Current number of keys in circulation.
+    pub supply: u32,
+    /// Hard supply cap configured at deployment, or `0` when uncapped.
+    pub cap: u32,
+    /// Keys that can still be minted: `cap - supply`, or `u32::MAX` when uncapped.
+    pub remaining: u32,
+}
+
 /// Shared result type for read-only quote methods.
 pub type QuoteViewResult = Result<QuoteResponse, ContractError>;
 
@@ -1350,11 +1371,19 @@ pub const HANDLE_LEN_MAX: u32 = 32;
 /// Maximum byte-length of the `name` field in [`KeyMetadata`].
 pub const METADATA_NAME_MAX_LEN: u32 = 64;
 
-/// Maximum byte-length of the `bio` field in [`KeyMetadata`].
-pub const METADATA_BIO_MAX_LEN: u32 = 256;
+/// Maximum byte-length of the `symbol` field in [`KeyMetadata`].
+pub const METADATA_SYMBOL_MAX_LEN: u32 = 12;
 
-/// Maximum byte-length of the `avatar_uri` field in [`KeyMetadata`].
-pub const METADATA_AVATAR_URI_MAX_LEN: u32 = 256;
+/// Maximum byte-length of the `description` field in [`KeyMetadata`].
+pub const METADATA_DESCRIPTION_MAX_LEN: u32 = 256;
+
+/// Maximum byte-length of the `image_cid` field in [`KeyMetadata`].
+pub const METADATA_IMAGE_CID_MAX_LEN: u32 = 256;
+
+/// Backward-compatible alias for [`METADATA_DESCRIPTION_MAX_LEN`].
+pub const METADATA_BIO_MAX_LEN: u32 = METADATA_DESCRIPTION_MAX_LEN;
+/// Backward-compatible alias for [`METADATA_IMAGE_CID_MAX_LEN`].
+pub const METADATA_AVATAR_URI_MAX_LEN: u32 = METADATA_IMAGE_CID_MAX_LEN;
 pub const MAX_WHITELIST_SIZE: u32 = 500;
 
 /// Maximum number of recipient entries accepted by a single
@@ -1802,6 +1831,10 @@ pub enum DataKey {
     CreatorCurveSlope(Address),
     /// (creator) -> number of completed curve resets -> `u32`.
     CurveResetCount(Address),
+    /// (creator) -> minimum key balance a wallet must hold to subscribe for
+    /// gated access (Issue #953). Absent means access gating is not configured
+    /// for that creator and `subscribe` rejects.
+    MinHoldForAccess(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1820,6 +1853,31 @@ pub struct ReinvestResult {
 pub enum StakingKey {
     /// Next sequential stake id for a `(creator, holder)` pair -> `u32`.
     NextStakeId(Address, Address),
+}
+
+/// Storage keys for key ratings, bundle offerings, performance bonds and atomic
+/// swaps.
+///
+/// Kept separate from [`DataKey`] to stay within Soroban's 50-variant
+/// `#[contracttype]` cap.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum FeatureKey {
+    // --- Key ratings ---
+    /// (creator) -> aggregate `KeyRatingAggregate` struct.
+    KeyRatingAggregate(Address),
+    /// (creator, rater) -> individual score submitted by `rater` -> `u32`.
+    HolderKeyRating(Address, Address),
+    // --- Bundle offerings ---
+    /// (bundle_id) -> `KeyBundle` struct.
+    KeyBundle(u64),
+    /// Next sequential bundle id -> `u64`.
+    NextBundleId,
+    // --- Performance bonds ---
+    /// (creator) -> locked performance bond amount in stroops -> `i128`.
+    PerformanceBond(Address),
+    /// Protocol-wide minimum performance bond amount configured by admin -> `i128`.
+    MinPerformanceBond,
 }
 
 /// Storage keys for the cycle-based protocol revenue distribution (#877).
@@ -2203,19 +2261,15 @@ pub struct ClaimResult {
     pub amount_claimed: i128,
 }
 
-/// Metadata associated with a creator key that can be set at initialisation
-/// and updated later via [`update_metadata`].
-///
-/// Only fields wrapped in `Some` are updated; `None` fields are left unchanged.
-/// Byte-length limits mirror the handle validation enforced by
-/// [`validate_creator_handle`] for `name` and use dedicated caps for `bio`
-/// and `avatar_uri`.
+/// Metadata associated with a creator key. Name and symbol are immutable after
+/// initialization; description and image CID can be changed by the creator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct KeyMetadata {
     pub name: String,
-    pub bio: String,
-    pub avatar_uri: String,
+    pub symbol: String,
+    pub description: String,
+    pub image_cid: String,
 }
 
 /// One recipient of a creator key airdrop: the wallet to credit and how many
@@ -2577,12 +2631,16 @@ fn is_valid_handle_byte(byte: u8) -> bool {
 pub fn read_creator_metadata(env: &Env, creator: &Address) -> Option<KeyMetadata> {
     use soroban_sdk::symbol_short;
     let key = (symbol_short!("md"), creator.clone());
-    env.storage().persistent().get(&key)
+    let metadata = env.storage().persistent().get(&key);
+    if metadata.is_some() {
+        extend_key_ttl_to_full_window(env, &key);
+    }
+    metadata
 }
 
 /// Validates the byte-length of a metadata string field.
 ///
-/// Returns [`ContractError::HandleTooLong`] when `value.len()` exceeds `max_len`.
+/// Returns `error` when `value.len()` exceeds `max_len`.
 fn assert_metadata_field_length(
     value: &String,
     max_len: u32,
@@ -2596,11 +2654,9 @@ fn assert_metadata_field_length(
 
 /// Validates a complete [`KeyMetadata`] payload.
 ///
-/// Rejects an empty `name` (blank or whitespace-only) with
-/// [`ContractError::DisplayNameEmpty`] and enforces per-field byte-length
-/// limits consistent with the handle rules used at registration.
+/// Rejects empty `name` and `symbol`, and enforces per-field byte-length limits.
 fn validate_key_metadata(metadata: &KeyMetadata) -> Result<(), ContractError> {
-    if metadata.name.is_empty() {
+    if metadata.name.is_empty() || metadata.symbol.is_empty() {
         return Err(ContractError::DisplayNameEmpty);
     }
     assert_metadata_field_length(
@@ -2609,14 +2665,19 @@ fn validate_key_metadata(metadata: &KeyMetadata) -> Result<(), ContractError> {
         ContractError::NameTooLong,
     )?;
     assert_metadata_field_length(
-        &metadata.bio,
-        METADATA_BIO_MAX_LEN,
+        &metadata.symbol,
+        METADATA_SYMBOL_MAX_LEN,
+        ContractError::NameTooLong,
+    )?;
+    assert_metadata_field_length(
+        &metadata.description,
+        METADATA_DESCRIPTION_MAX_LEN,
         ContractError::BioTooLong,
     )?;
     assert_metadata_field_length(
-        &metadata.avatar_uri,
-        METADATA_AVATAR_URI_MAX_LEN,
-        ContractError::NameTooLong,
+        &metadata.image_cid,
+        METADATA_IMAGE_CID_MAX_LEN,
+        ContractError::BioTooLong,
     )?;
     Ok(())
 }
@@ -2626,6 +2687,7 @@ fn write_creator_metadata(env: &Env, creator: &Address, metadata: &KeyMetadata) 
     use soroban_sdk::symbol_short;
     let key = (symbol_short!("md"), creator.clone());
     env.storage().persistent().set(&key, metadata);
+    extend_key_ttl_to_full_window(env, &key);
 }
 
 /// Validates a creator's display handle.
@@ -3864,6 +3926,13 @@ pub(crate) fn extend_creator_ttl(env: &Env, creator: &Address) {
         .persistent()
         .extend_ttl(&creator_key, threshold, extend_to);
 
+    let metadata_key = (soroban_sdk::symbol_short!("md"), creator.clone());
+    if env.storage().persistent().has(&metadata_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&metadata_key, threshold, extend_to);
+    }
+
     let fee_balance_key = constants::storage::creator_fee_balance(creator);
     if env.storage().persistent().has(&fee_balance_key) {
         env.storage()
@@ -4681,6 +4750,18 @@ fn accrue_trade_analytics(
         let current_ut: u64 = env.storage().persistent().get(&ut_key).unwrap_or(0);
         let new_ut = current_ut.checked_add(1).ok_or(ContractError::Overflow)?;
         env.storage().persistent().set(&ut_key, &new_ut);
+
+        // Emitted only inside this branch, so an indexer gets exactly one
+        // event per wallet per creator rather than one per trade.
+        env.events().publish(
+            events::unique_trader_added_topics(creator, trader),
+            events::UniqueTraderAddedEvent {
+                key_id: creator.clone(),
+                trader: trader.clone(),
+                unique_trader_count: new_ut,
+                ledger: env.ledger().sequence(),
+            },
+        );
     }
 
     // Accumulate volume
@@ -4935,6 +5016,121 @@ fn is_escalation_eligible(
     (participation_bps as u128) >= required_bps
 }
 
+// ============================================================================
+// Feature structs: key ratings, bundle offerings, performance bonds, atomic swaps
+// ============================================================================
+
+/// Aggregated rating summary for a creator key.
+///
+/// `total_score` is the sum of all individual scores, `count` is the number of
+/// unique raters, and `average_score_scaled` is `(total_score * 100) / count`
+/// (e.g. 450 == 4.50 stars).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyRatingAggregate {
+    pub total_score: u64,
+    pub count: u32,
+    /// Running average × 100 (e.g. 450 == 4.50 stars).
+    pub average_score_scaled: u32,
+}
+
+/// Errors raised by [`CreatorKeysContract::rate_key`].
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RatingError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The score is outside the accepted range (1–5).
+    InvalidScore = 2,
+    /// The rater holds zero keys for this creator.
+    NotAHolder = 3,
+}
+
+/// A single entry inside a key bundle (key ID + quantity).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct BundleEntry {
+    pub key_id: Address,
+    pub quantity: u32,
+}
+
+/// A creator-defined bundle of multiple keys sold at a discounted combined price.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyBundle {
+    pub bundle_id: u64,
+    pub creator: Address,
+    pub entries: Vec<BundleEntry>,
+    /// Discounted total price in stroops; must be ≥ `min_price_floor`.
+    pub discounted_price: i128,
+    /// Ledger at which the bundle expires (inclusive).
+    pub expires_at_ledger: u32,
+}
+
+/// Errors raised by bundle entrypoints.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum BundleError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The discounted price is below the minimum price floor.
+    BelowPriceFloor = 2,
+    /// The bundle has expired.
+    BundleExpired = 3,
+    /// The bundle was not found.
+    BundleNotFound = 4,
+    /// The bundle entry list is empty.
+    EmptyBundle = 5,
+    /// The buyer has insufficient balance.
+    InsufficientBalance = 6,
+    /// Arithmetic overflow.
+    Overflow = 7,
+    /// The caller is not the bundle creator.
+    Unauthorized = 8,
+    /// The protocol is paused.
+    ProtocolPaused = 9,
+}
+
+/// Errors raised by performance bond entrypoints.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum BondError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// The bond amount is below the configured minimum.
+    BelowMinimumBond = 2,
+    /// No bond has been staked for this creator.
+    BondNotFound = 3,
+    /// The caller is not the protocol admin.
+    Unauthorized = 4,
+    /// Arithmetic overflow.
+    Overflow = 5,
+    /// The bond amount is not positive.
+    NotPositiveAmount = 6,
+}
+
+/// Errors raised by [`CreatorKeysContract::atomic_swap`].
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SwapError {
+    /// The creator is not registered.
+    NotRegistered = 1,
+    /// One side has insufficient liquid balance.
+    InsufficientBalance = 2,
+    /// One wallet's position is frozen.
+    FrozenPosition = 3,
+    /// Arithmetic overflow in fee calculation.
+    Overflow = 4,
+    /// The protocol is paused.
+    ProtocolPaused = 5,
+    /// Swap amount is zero.
+    ZeroAmount = 6,
+}
+
 #[contract]
 pub struct CreatorKeysContract;
 
@@ -5024,17 +5220,18 @@ impl CreatorKeysContract {
             );
         }
 
-        // Handle max supply cap
+        // Handle max supply cap (issue #997): a cap of `0` is normalized to
+        // "unlimited" — the key grows without limit, the cap entry stays
+        // unwritten, and `get_supply_info` reports `cap = 0`.
         if let Some(cap) = max_supply {
-            if cap == 0 {
-                return Err(ContractError::NotPositiveAmount);
+            if cap > 0 {
+                if supply > cap {
+                    return Err(ContractError::SupplyCapExceeded);
+                }
+                env.storage()
+                    .persistent()
+                    .set(&constants::storage::max_supply(&creator), &cap);
             }
-            if supply > cap {
-                return Err(ContractError::SupplyCapExceeded);
-            }
-            env.storage()
-                .persistent()
-                .set(&constants::storage::max_supply(&creator), &cap);
         }
 
         // Handle max keys per wallet cap
@@ -5118,6 +5315,102 @@ impl CreatorKeysContract {
         );
 
         Ok(())
+    }
+
+    /// Rates a creator key (score 1-5). Requires non-zero key holding balance.
+    /// Emits `KeyRated` event and maintains incremental running average.
+    pub fn rate_key(
+        env: Env,
+        creator: Address,
+        rater: Address,
+        score: u32,
+    ) -> Result<KeyRatingAggregate, RatingError> {
+        rater.require_auth();
+
+        if !(1..=5).contains(&score) {
+            return Err(RatingError::InvalidScore);
+        }
+
+        let creator_key = constants::storage::creator(&creator);
+        if !env.storage().persistent().has(&creator_key) {
+            return Err(RatingError::NotRegistered);
+        }
+
+        let holder_bal = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&constants::storage::holder_balance_key(&creator, &rater))
+            .unwrap_or(0);
+        if holder_bal == 0 {
+            return Err(RatingError::NotAHolder);
+        }
+
+        let agg_key = FeatureKey::KeyRatingAggregate(creator.clone());
+        let mut agg = env
+            .storage()
+            .persistent()
+            .get::<_, KeyRatingAggregate>(&agg_key)
+            .unwrap_or(KeyRatingAggregate {
+                total_score: 0,
+                count: 0,
+                average_score_scaled: 0,
+            });
+
+        let rater_key = FeatureKey::HolderKeyRating(creator.clone(), rater.clone());
+        if let Some(prev_score) = env.storage().persistent().get::<_, u32>(&rater_key) {
+            agg.total_score = agg
+                .total_score
+                .checked_sub(prev_score as u64)
+                .ok_or(RatingError::NotRegistered)?
+                .checked_add(score as u64)
+                .ok_or(RatingError::NotRegistered)?;
+        } else {
+            agg.count = agg.count.checked_add(1).ok_or(RatingError::NotRegistered)?;
+            agg.total_score = agg
+                .total_score
+                .checked_add(score as u64)
+                .ok_or(RatingError::NotRegistered)?;
+        }
+
+        agg.average_score_scaled = if agg.count > 0 {
+            ((agg.total_score as u128 * 100) / (agg.count as u128)) as u32
+        } else {
+            0
+        };
+
+        env.storage().persistent().set(&rater_key, &score);
+        extend_key_ttl_to_full_window(&env, &rater_key);
+
+        env.storage().persistent().set(&agg_key, &agg);
+        extend_key_ttl_to_full_window(&env, &agg_key);
+
+        env.events().publish(
+            events::key_rated_topics(&creator, &rater),
+            events::KeyRatedEvent {
+                creator: creator.clone(),
+                rater: rater.clone(),
+                score,
+                total_score: agg.total_score,
+                count: agg.count,
+                average_score_scaled: agg.average_score_scaled,
+                ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(agg)
+    }
+
+    /// Gets the current rating aggregate for a creator key.
+    pub fn get_key_rating(env: Env, creator: Address) -> KeyRatingAggregate {
+        let agg_key = FeatureKey::KeyRatingAggregate(creator);
+        env.storage()
+            .persistent()
+            .get::<_, KeyRatingAggregate>(&agg_key)
+            .unwrap_or(KeyRatingAggregate {
+                total_score: 0,
+                count: 0,
+                average_score_scaled: 0,
+            })
     }
 
     pub fn buy_key(
@@ -5394,6 +5687,26 @@ impl CreatorKeysContract {
                 .persistent()
                 .set(&last_buy_key, &env.ledger().timestamp());
             extend_key_ttl_to_full_window(&env, &last_buy_key);
+
+            // SupplyCapReached (#997): fire exactly once, on the key that fills
+            // the configured cap (a partial fill that reaches the cap emits it).
+            if let Some(cap) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, u32>(&constants::storage::max_supply(&creator))
+            {
+                if profile.supply == cap {
+                    env.events().publish(
+                        events::supply_cap_reached_topics(&creator),
+                        events::SupplyCapReachedEvent {
+                            creator_id: creator.clone(),
+                            new_supply: profile.supply,
+                            cap,
+                            ledger: env.ledger().sequence(),
+                        },
+                    );
+                }
+            }
 
             total_price = total_price
                 .checked_add(key_price)
@@ -5784,6 +6097,26 @@ impl CreatorKeysContract {
         // Grant the balance entry the full TTL window so long-held positions
         // survive the same horizon as creator state between trades.
         extend_key_ttl_to_full_window(&env, &balance_key);
+
+        // SupplyCapReached (#997): fire exactly once, on the trade that fills
+        // the configured cap. Uncapped keys (cap 0) never emit it.
+        if let Some(cap) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&constants::storage::max_supply(&creator))
+        {
+            if profile.supply == cap {
+                env.events().publish(
+                    events::supply_cap_reached_topics(&creator),
+                    events::SupplyCapReachedEvent {
+                        creator_id: creator.clone(),
+                        new_supply: profile.supply,
+                        cap,
+                        ledger: env.ledger().sequence(),
+                    },
+                );
+            }
+        }
 
         // Flash-loan guard (issue #781): record this buy's ledger so sell_key can
         // reject a same-ledger sell of the position just bought.
@@ -7103,6 +7436,139 @@ impl CreatorKeysContract {
         Self::get_key_balance(env, creator, wallet)
     }
 
+    // ── Subscription access gating (Issue #953) ────────────────────────────
+    //
+    // `curve_subscriptions_swaps::subscribe_key_access` takes the subscriber's
+    // balance and the minimum as *parameters*. That is fine for an internal
+    // helper but must never be the contract's surface: a caller-supplied
+    // `subscriber_balance` makes the minimum-hold check self-attested, so any
+    // wallet could claim to hold enough and gate itself in.
+    //
+    // These entry points read both values from storage instead — the balance via
+    // `get_key_balance`, the minimum from `DataKey::MinHoldForAccess` — so the
+    // threshold is enforced against what the ledger actually says.
+
+    /// Sets the minimum key balance a wallet must hold to subscribe.
+    ///
+    /// Admin-only. The creator is deliberately *not* allowed to set their own
+    /// threshold: it gates paid access, so a creator who could lower it at will
+    /// could grant access to wallets holding nothing, which is the outcome the
+    /// gate exists to prevent.
+    pub fn set_min_hold_for_access(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        min_keys: u32,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        assert_is_admin(&env, &admin)?;
+
+        if min_keys == 0 {
+            // Zero would gate nothing while looking configured. Removing the
+            // key is the honest way to disable gating, and `subscribe` reports
+            // that state distinctly.
+            return Err(ContractError::NotPositiveAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinHoldForAccess(creator.clone()), &min_keys);
+
+        env.events()
+            .publish((soroban_sdk::symbol_short!("MIN_HOLD"), creator), min_keys);
+
+        Ok(())
+    }
+
+    /// The configured minimum hold for a creator, or `None` when gating is off.
+    pub fn get_min_hold_for_access(env: Env, creator: Address) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinHoldForAccess(creator))
+    }
+
+    /// Subscribes `subscriber` to `creator`'s gated access for
+    /// `duration_ledgers`, provided they hold at least the configured minimum.
+    ///
+    /// The balance is read from storage, not supplied by the caller. Returns the
+    /// expiry ledger.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::NotPositiveAmount`] if `duration_ledgers` is zero — a
+    ///   subscription expiring on the ledger it was created in is never usable.
+    /// - [`ContractError::NotRegistered`] if no minimum is configured for the
+    ///   creator. Reported distinctly from an insufficient balance so an
+    ///   operator can tell "gating is off" from "you need more keys".
+    /// - [`ContractError::InsufficientBalance`] if the wallet holds less than
+    ///   the minimum.
+    pub fn subscribe(
+        env: Env,
+        creator: Address,
+        subscriber: Address,
+        duration_ledgers: u32,
+    ) -> Result<u32, ContractError> {
+        // No `require_auth` here: `subscribe_key_access` performs it, and a
+        // second call on the same frame fails with `Auth(ExistingValue)` —
+        // "frame is already authorized". Authorization is still enforced before
+        // any state change, since the helper requires it before writing.
+        //
+        // The cheap argument checks below therefore run unauthenticated, which
+        // is the right order anyway: a caller should learn that the duration is
+        // zero or that gating is unconfigured without being asked to sign.
+        if duration_ledgers == 0 {
+            return Err(ContractError::NotPositiveAmount);
+        }
+
+        let min_keys: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinHoldForAccess(creator.clone()))
+            .ok_or(ContractError::NotRegistered)?;
+
+        let balance = Self::get_key_balance(env.clone(), creator.clone(), subscriber.clone());
+
+        crate::curve_subscriptions_swaps::subscribe_key_access(
+            &env,
+            &creator,
+            &subscriber,
+            duration_ledgers,
+            min_keys,
+            balance,
+        )
+    }
+
+    /// Whether `subscriber` currently has gated access to `creator`.
+    ///
+    /// Re-checks the live balance against the minimum recorded on the
+    /// subscription, so access lapses the moment a holder sells below the
+    /// threshold — no revocation transaction required. That is what "revoked
+    /// automatically when holding drops below minimum" means here: the gate is
+    /// evaluated on read rather than swept by a job, so there is no window in
+    /// which a sold-out wallet still passes.
+    ///
+    /// Returns `false` for an unknown subscription, an expired one, or a
+    /// balance that has since fallen below the recorded minimum.
+    pub fn is_subscribed(env: Env, creator: Address, subscriber: Address) -> bool {
+        let balance = Self::get_key_balance(env.clone(), creator.clone(), subscriber.clone());
+        crate::curve_subscriptions_swaps::is_subscribed(&env, &creator, &subscriber, balance)
+    }
+
+    /// The stored subscription record, if any.
+    ///
+    /// Exposed alongside [`Self::is_subscribed`] because the boolean alone
+    /// cannot tell a caller *why* access was denied — expired, or under the
+    /// threshold. A UI needs to say which.
+    pub fn get_subscription(
+        env: Env,
+        creator: Address,
+        subscriber: Address,
+    ) -> Option<crate::curve_subscriptions_swaps::KeySubscription> {
+        env.storage().instance().get(
+            &crate::curve_subscriptions_swaps::EmdevelopaDataKey::Subscription(creator, subscriber),
+        )
+    }
+
     /// Read-only view: returns a stable view of a holder's key count for a creator.
     ///
     /// Returns a [`HolderKeyCountView`] regardless of creator registration status.
@@ -7868,19 +8334,20 @@ impl CreatorKeysContract {
             .get(&constants::storage::auction_config(&creator))
     }
 
-    /// Stores on-chain identity metadata (name, bio, avatar URI) for a
+    /// Stores on-chain identity metadata (name, symbol, description, image CID) for a
     /// registered creator's key (issue #779).
     ///
-    /// Callable only by the creator themselves, once. To change metadata
-    /// afterwards, see the immutability note on [`ContractError::KeyAlreadyInitialised`] —
-    /// this contract has no `update_key_metadata` entrypoint; adding one is a
-    /// natural follow-up but out of scope for this issue.
+    /// Callable only by the creator themselves, once, for keys registered
+    /// without metadata. Creator-managed changes to description and image CID
+    /// are available through [`update_metadata`].
     ///
     /// # Errors
     /// - [`ContractError::NotRegistered`] if `creator` has no profile.
-    /// - [`ContractError::DisplayNameEmpty`] if `name` or `bio` is empty.
+    /// - [`ContractError::DisplayNameEmpty`] if `name` or `symbol` is empty.
     /// - [`ContractError::NameTooLong`] if `name` exceeds 64 bytes.
-    /// - [`ContractError::BioTooLong`] if `bio` exceeds 256 bytes.
+    /// - [`ContractError::NameTooLong`] if `symbol` exceeds 12 bytes.
+    /// - [`ContractError::BioTooLong`] if `description` or `image_cid` exceeds
+    ///   256 bytes.
     /// - [`ContractError::KeyAlreadyInitialised`] if metadata already exists
     ///   for `creator`.
     pub fn initialise_key(
@@ -7904,8 +8371,11 @@ impl CreatorKeysContract {
             events::KeyInitialisedEvent {
                 creator_id: creator,
                 name: metadata.name,
-                bio: metadata.bio,
-                avatar_uri: metadata.avatar_uri,
+                bio: metadata.description.clone(),
+                avatar_uri: metadata.image_cid.clone(),
+                symbol: metadata.symbol,
+                description: metadata.description,
+                image_cid: metadata.image_cid,
             },
         );
 
@@ -7913,9 +8383,14 @@ impl CreatorKeysContract {
     }
 
     /// Read-only view: returns a creator's on-chain key metadata, or `None`
-    /// if `initialise_key` has not been called for them.
+    /// if metadata has not been initialized for them.
     pub fn get_key_metadata(env: Env, creator: Address) -> Option<KeyMetadata> {
         read_creator_metadata(&env, &creator)
+    }
+
+    /// Read-only view: returns a key's complete on-chain metadata.
+    pub fn get_metadata(env: Env, key_id: Address) -> Option<KeyMetadata> {
+        read_creator_metadata(&env, &key_id)
     }
 
     /// Registers a creator key on their behalf with its full initial config:
@@ -8025,63 +8500,62 @@ impl CreatorKeysContract {
             .unwrap_or(false)
     }
 
-    /// Updates a creator's key metadata. Only fields wrapped in `Some` are
-    /// changed; `None` fields remain untouched. Emits `MetadataUpdated`.
+    /// Updates a creator's description and image CID. Name and symbol are
+    /// immutable after key initialization. Only the creator may update them.
     pub fn update_metadata(
         env: Env,
-        creator: Address,
-        name: Option<String>,
-        bio: Option<String>,
-        avatar_uri: Option<String>,
+        key_id: Address,
+        description: String,
+        image_cid: String,
     ) -> Result<(), ContractError> {
-        creator.require_auth();
+        key_id.require_auth();
         let mut metadata =
-            read_creator_metadata(&env, &creator).ok_or(ContractError::NotRegistered)?;
+            read_creator_metadata(&env, &key_id).ok_or(ContractError::NotRegistered)?;
 
-        let mut changed = false;
-        let mut updated_name = String::from_str(&env, "");
-        let mut updated_bio = String::from_str(&env, "");
-        let mut updated_avatar = String::from_str(&env, "");
+        assert_metadata_field_length(
+            &description,
+            METADATA_DESCRIPTION_MAX_LEN,
+            ContractError::BioTooLong,
+        )?;
+        assert_metadata_field_length(
+            &image_cid,
+            METADATA_IMAGE_CID_MAX_LEN,
+            ContractError::BioTooLong,
+        )?;
 
-        if let Some(n) = name {
-            if n.len() > METADATA_NAME_MAX_LEN {
-                return Err(ContractError::HandleTooLong);
-            }
-            updated_name = n.clone();
-            metadata.name = n;
-            changed = true;
-        }
-        if let Some(b) = bio {
-            if b.len() > METADATA_BIO_MAX_LEN {
-                return Err(ContractError::HandleTooLong);
-            }
-            updated_bio = b.clone();
-            metadata.bio = b;
-            changed = true;
-        }
-        if let Some(u) = avatar_uri {
-            if u.len() > METADATA_AVATAR_URI_MAX_LEN {
-                return Err(ContractError::HandleTooLong);
-            }
-            updated_avatar = u.clone();
-            metadata.avatar_uri = u;
-            changed = true;
-        }
+        let updated_description = if metadata.description != description {
+            metadata.description = description.clone();
+            Some(description)
+        } else {
+            None
+        };
+        let updated_image_cid = if metadata.image_cid != image_cid {
+            metadata.image_cid = image_cid.clone();
+            Some(image_cid)
+        } else {
+            None
+        };
 
-        if !changed {
+        if updated_description.is_none() && updated_image_cid.is_none() {
             return Ok(());
         }
 
-        write_creator_metadata(&env, &creator, &metadata);
+        write_creator_metadata(&env, &key_id, &metadata);
 
         env.events().publish(
-            events::metadata_updated_topics(&creator),
+            events::metadata_updated_topics(&key_id),
             events::MetadataUpdatedEvent {
-                creator_id: creator.clone(),
-                name: updated_name,
-                bio: updated_bio,
-                avatar_uri: updated_avatar,
+                creator_id: key_id,
+                name: String::from_str(&env, ""),
+                bio: updated_description
+                    .clone()
+                    .unwrap_or(String::from_str(&env, "")),
+                avatar_uri: updated_image_cid
+                    .clone()
+                    .unwrap_or(String::from_str(&env, "")),
                 ledger: env.ledger().sequence(),
+                description: updated_description,
+                image_cid: updated_image_cid,
             },
         );
 
@@ -14429,6 +14903,33 @@ impl CreatorKeysContract {
         Ok(profile.supply)
     }
 
+    /// Read-only view (#997): returns the current supply, the configured hard
+    /// supply cap, and the remaining mintable supply for a key.
+    ///
+    /// A cap of `0` means the key is uncapped: `remaining` is `u32::MAX` and
+    /// the buy entrypoints never enforce a ceiling.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotRegistered`] if the creator is not registered.
+    pub fn get_supply_info(env: Env, key_id: Address) -> Result<SupplyInfo, ContractError> {
+        let profile = read_registered_creator_profile(&env, &key_id)?;
+        let cap_key = constants::storage::max_supply(&key_id);
+        let cap: u32 = env.storage().persistent().get(&cap_key).unwrap_or(0);
+        if cap > 0 {
+            bump_persistent_ttl(&env, &cap_key);
+        }
+        let remaining = if cap == 0 {
+            u32::MAX
+        } else {
+            cap.saturating_sub(profile.supply)
+        };
+        Ok(SupplyInfo {
+            supply: profile.supply,
+            cap,
+            remaining,
+        })
+    }
+
     /// Read-only view: returns the current buy and sell price for a creator's key,
     /// with the configured bid-ask spread applied to the sell price.
     ///
@@ -14536,6 +15037,42 @@ impl CreatorKeysContract {
             unique_traders,
             total_volume,
         })
+    }
+
+    /// Read-only view: returns how many distinct wallets have traded a
+    /// creator's keys.
+    ///
+    /// A wallet is counted once, on its first buy or sell; later trades from
+    /// the same wallet do not change the value. Equivalent to the
+    /// `unique_traders` field of [`Self::get_analytics`], exposed on its own so
+    /// callers that only need the count do not pay for the other two reads.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotRegistered`] if the creator is not registered.
+    pub fn get_unique_trader_count(env: Env, key_id: Address) -> Result<u64, ContractError> {
+        read_registered_creator_profile(&env, &key_id)?;
+        Ok(env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&constants::storage::unique_trader_count(&key_id))
+            .unwrap_or(0))
+    }
+
+    /// Read-only view: returns whether `wallet` has ever traded `key_id`.
+    ///
+    /// True from the wallet's first buy or sell onwards. Selling a position
+    /// down to zero does not reset it — the flag records that a trade happened,
+    /// not that a balance is held.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotRegistered`] if the creator is not registered.
+    pub fn has_traded(env: Env, key_id: Address, wallet: Address) -> Result<bool, ContractError> {
+        read_registered_creator_profile(&env, &key_id)?;
+        Ok(env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&constants::storage::has_traded(&key_id, &wallet))
+            .unwrap_or(false))
     }
 
     // -----------------------------------------------------------------------
@@ -15230,6 +15767,67 @@ impl CreatorKeysContract {
         );
 
         Ok(new_expires_at)
+    }
+
+    // =========================================================================
+    // Issue #1002: Liquidity provider reward contract for key pairs
+    // =========================================================================
+
+    /// Locks tokens as liquidity and records LP share.
+    pub fn add_liquidity(
+        env: Env,
+        key_id: Address,
+        provider: Address,
+        amount: i128,
+    ) -> Result<u64, lp_reward::LpRewardError> {
+        lp_reward::add_liquidity(&env, key_id, provider, amount)
+    }
+
+    /// Convenience alias with (provider, key_id, amount) parameter order.
+    pub fn add_liquidity_for(
+        env: Env,
+        provider: Address,
+        key_id: Address,
+        amount: i128,
+    ) -> Result<u64, lp_reward::LpRewardError> {
+        lp_reward::add_liquidity(&env, key_id, provider, amount)
+    }
+
+    /// Returns tokens plus accrued fee rewards, closing the position.
+    pub fn remove_liquidity(env: Env, lp_id: u64) -> Result<i128, lp_reward::LpRewardError> {
+        lp_reward::remove_liquidity(&env, lp_id)
+    }
+
+    /// Claims rewards without removing liquidity.
+    pub fn claim_lp_rewards(env: Env, lp_id: u64) -> Result<i128, lp_reward::LpRewardError> {
+        lp_reward::claim_lp_rewards(&env, lp_id)
+    }
+
+    /// Returns contribution, share, and pending rewards at any point.
+    pub fn get_lp_position(
+        env: Env,
+        lp_id: u64,
+    ) -> Result<lp_reward::LpPosition, lp_reward::LpRewardError> {
+        lp_reward::get_lp_position(&env, lp_id)
+    }
+
+    /// Accrues fee rewards to key pair pool proportional to trading volume.
+    pub fn accrue_lp_trading_fee(
+        env: Env,
+        key_id: Address,
+        fee_amount: i128,
+    ) -> Result<(), lp_reward::LpRewardError> {
+        lp_reward::accrue_trading_fee(&env, key_id, fee_amount)
+    }
+
+    /// Read-only view of total pool liquidity for a key pair.
+    pub fn get_lp_total_liquidity(env: Env, key_id: Address) -> i128 {
+        lp_reward::get_total_liquidity(&env, key_id)
+    }
+
+    /// Read-only view of total collected trading rewards for a key pair.
+    pub fn get_lp_pool_rewards(env: Env, key_id: Address) -> i128 {
+        lp_reward::get_pool_rewards(&env, key_id)
     }
 }
 
@@ -17922,3 +18520,9 @@ mod test_issues_924;
 
 #[cfg(test)]
 mod test_timelocked_upgrade;
+
+#[cfg(test)]
+mod test_unique_traders;
+
+#[cfg(test)]
+mod test_lp_reward;

@@ -610,6 +610,9 @@ pub struct KeyInitialisedEvent {
     pub name: String,
     pub bio: String,
     pub avatar_uri: String,
+    pub symbol: String,
+    pub description: String,
+    pub image_cid: String,
 }
 
 pub fn key_initialised_topics(creator_id: &Address) -> (Symbol, Address) {
@@ -840,6 +843,34 @@ pub struct SupplyCapSetEvent {
 
 pub fn supply_cap_set_topics(creator: &Address) -> (Symbol, Address) {
     (SUPPLY_CAP_SET_EVENT_NAME, creator.clone())
+}
+
+/// Event name emitted exactly once when a buy fills a capped key's supply to
+/// its configured cap. Subsequent buys revert with `SupplyCapExceeded`, so the
+/// event is never emitted again for the same key.
+pub const SUPPLY_CAP_REACHED_EVENT_NAME: Symbol = symbol_short!("cap_reach");
+
+/// Stable supply-cap-reached event payload.
+///
+/// Event shape:
+/// - topics: `(SUPPLY_CAP_REACHED_EVENT_NAME, creator_id)`
+/// - data: `SupplyCapReachedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SupplyCapReachedEvent {
+    /// Creator whose key supply just reached the configured cap.
+    pub creator_id: Address,
+    /// New total supply, which now equals the configured cap.
+    pub new_supply: u32,
+    /// The configured cap that was reached.
+    pub cap: u32,
+    /// Ledger in which the cap was reached.
+    pub ledger: u32,
+}
+
+/// Shared supply-cap-reached event topics tuple.
+pub fn supply_cap_reached_topics(creator: &Address) -> (Symbol, Address) {
+    (SUPPLY_CAP_REACHED_EVENT_NAME, creator.clone())
 }
 
 // --- Multisig pause events ---
@@ -2739,14 +2770,18 @@ pub const METADATA_UPDATED_EVENT_NAME: Symbol = symbol_short!("meta_upd");
 pub struct MetadataUpdatedEvent {
     /// Creator whose metadata was updated.
     pub creator_id: Address,
-    /// Updated name, or empty string if unchanged.
+    /// Legacy field; the key name is immutable and this remains empty.
     pub name: String,
-    /// Updated bio, or empty string if unchanged.
+    /// Legacy mirror of `description`; empty when unchanged.
     pub bio: String,
-    /// Updated avatar URI, or empty string if unchanged.
+    /// Legacy mirror of `image_cid`; empty when unchanged.
     pub avatar_uri: String,
     /// Ledger sequence number at the time of the update.
     pub ledger: u32,
+    /// Updated description, or `None` if unchanged.
+    pub description: Option<String>,
+    /// Updated image CID, or `None` if unchanged.
+    pub image_cid: Option<String>,
 }
 
 /// Shared metadata-updated event topics tuple.
@@ -2882,6 +2917,47 @@ pub struct ReputationUpdatedEvent {
 /// Shared reputation-updated event topics tuple.
 pub fn reputation_updated_topics(creator: &Address) -> (Symbol, Address) {
     (REPUTATION_UPDATED_EVENT_NAME, creator.clone())
+}
+
+// ============================================================================
+// Feature: unique trader analytics
+// ============================================================================
+
+/// Event name emitted the first time a wallet trades a creator's keys.
+pub const UNIQUE_TRADER_ADDED_EVENT_NAME: Symbol = symbol_short!("uniq_trd");
+
+/// Stable unique-trader event payload.
+///
+/// Event shape:
+/// - topics: `(UNIQUE_TRADER_ADDED_EVENT_NAME, key_id, trader)`
+/// - data: `UniqueTraderAddedEvent`
+///
+/// Emitted exactly once per `(key_id, trader)` pair, on that wallet's first
+/// buy or sell. Repeat trades from the same wallet emit nothing, so an indexer
+/// can count these events directly instead of de-duplicating trade events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct UniqueTraderAddedEvent {
+    /// Creator whose keys were traded.
+    pub key_id: Address,
+    /// Wallet trading these keys for the first time.
+    pub trader: Address,
+    /// Unique trader count after this wallet was counted.
+    pub unique_trader_count: u64,
+    /// Ledger in which the first trade was recorded.
+    pub ledger: u32,
+}
+
+/// Shared unique-trader event topics tuple.
+pub fn unique_trader_added_topics(
+    key_id: &Address,
+    trader: &Address,
+) -> (Symbol, Address, Address) {
+    (
+        UNIQUE_TRADER_ADDED_EVENT_NAME,
+        key_id.clone(),
+        trader.clone(),
+    )
 }
 
 // ============================================================================
@@ -3393,4 +3469,27 @@ pub struct CurveResetEvent {
 /// Shared curve reset event topics tuple.
 pub fn curve_reset_topics(creator: &Address) -> (Symbol, Address) {
     (CURVE_RESET_EVENT_NAME, creator.clone())
+}
+
+// --- Key rating ---
+
+/// Event name for a key rating submission.
+pub const KEY_RATED_EVENT_NAME: Symbol = symbol_short!("key_rated");
+
+/// Event payload emitted when a key holder rates a creator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct KeyRatedEvent {
+    pub creator: Address,
+    pub rater: Address,
+    pub score: u32,
+    pub total_score: u64,
+    pub count: u32,
+    pub average_score_scaled: u32,
+    pub ledger: u32,
+}
+
+/// Shared key rated event topics tuple.
+pub fn key_rated_topics(creator: &Address, rater: &Address) -> (Symbol, Address, Address) {
+    (KEY_RATED_EVENT_NAME, creator.clone(), rater.clone())
 }
