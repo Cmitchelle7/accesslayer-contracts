@@ -1,5 +1,5 @@
 [package]
-name = "creator-keys-factory"
+name = "lp-reward-contract"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -9,7 +9,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-creator-keys = { path = "../creator-keys" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

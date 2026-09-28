@@ -609,6 +609,9 @@ pub struct KeyInitialisedEvent {
     pub name: String,
     pub bio: String,
     pub avatar_uri: String,
+    pub symbol: String,
+    pub description: String,
+    pub image_cid: String,
 }
 
 pub fn key_initialised_topics(creator_id: &Address) -> (Symbol, Address) {
@@ -839,6 +842,34 @@ pub struct SupplyCapSetEvent {
 
 pub fn supply_cap_set_topics(creator: &Address) -> (Symbol, Address) {
     (SUPPLY_CAP_SET_EVENT_NAME, creator.clone())
+}
+
+/// Event name emitted exactly once when a buy fills a capped key's supply to
+/// its configured cap. Subsequent buys revert with `SupplyCapExceeded`, so the
+/// event is never emitted again for the same key.
+pub const SUPPLY_CAP_REACHED_EVENT_NAME: Symbol = symbol_short!("cap_reach");
+
+/// Stable supply-cap-reached event payload.
+///
+/// Event shape:
+/// - topics: `(SUPPLY_CAP_REACHED_EVENT_NAME, creator_id)`
+/// - data: `SupplyCapReachedEvent`
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SupplyCapReachedEvent {
+    /// Creator whose key supply just reached the configured cap.
+    pub creator_id: Address,
+    /// New total supply, which now equals the configured cap.
+    pub new_supply: u32,
+    /// The configured cap that was reached.
+    pub cap: u32,
+    /// Ledger in which the cap was reached.
+    pub ledger: u32,
+}
+
+/// Shared supply-cap-reached event topics tuple.
+pub fn supply_cap_reached_topics(creator: &Address) -> (Symbol, Address) {
+    (SUPPLY_CAP_REACHED_EVENT_NAME, creator.clone())
 }
 
 // --- Multisig pause events ---
@@ -2669,14 +2700,18 @@ pub const METADATA_UPDATED_EVENT_NAME: Symbol = symbol_short!("meta_upd");
 pub struct MetadataUpdatedEvent {
     /// Creator whose metadata was updated.
     pub creator_id: Address,
-    /// Updated name, or empty string if unchanged.
+    /// Legacy field; the key name is immutable and this remains empty.
     pub name: String,
-    /// Updated bio, or empty string if unchanged.
+    /// Legacy mirror of `description`; empty when unchanged.
     pub bio: String,
-    /// Updated avatar URI, or empty string if unchanged.
+    /// Legacy mirror of `image_cid`; empty when unchanged.
     pub avatar_uri: String,
     /// Ledger sequence number at the time of the update.
     pub ledger: u32,
+    /// Updated description, or `None` if unchanged.
+    pub description: Option<String>,
+    /// Updated image CID, or `None` if unchanged.
+    pub image_cid: Option<String>,
 }
 
 /// Shared metadata-updated event topics tuple.
