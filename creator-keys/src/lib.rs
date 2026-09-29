@@ -189,6 +189,9 @@ pub enum ContractError {
     /// The supplied timelocked action is not of the change type the caller
     /// requires (for example approving a non-upgrade action).
     InvalidChangeType = 100,
+    // --- Whitelist gate (Issue #998) ---
+    /// The whitelist for this key is permanently disabled and cannot be re-enabled.
+    WhitelistPermanentlyDisabled = 101,
 }
 
 /// Errors raised by the staking entrypoints
@@ -818,6 +821,10 @@ pub mod constants {
             DataKey::WhitelistMode(key_id.clone())
         }
 
+        pub fn whitelist_permanently_disabled(key_id: &Address) -> DataKey {
+            DataKey::WhitelistPermanentlyDisabled(key_id.clone())
+        }
+
         pub fn vesting_claimed(creator: &Address, beneficiary: &Address) -> DataKey {
             DataKey::VestingClaimed(creator.clone(), beneficiary.clone())
         }
@@ -1386,6 +1393,8 @@ pub const METADATA_BIO_MAX_LEN: u32 = METADATA_DESCRIPTION_MAX_LEN;
 /// Backward-compatible alias for [`METADATA_IMAGE_CID_MAX_LEN`].
 pub const METADATA_AVATAR_URI_MAX_LEN: u32 = METADATA_IMAGE_CID_MAX_LEN;
 pub const MAX_WHITELIST_SIZE: u32 = 500;
+/// Maximum number of wallets that can be added in a single `set_whitelist` batch call (Issue #998).
+pub const MAX_WHITELIST_BATCH_SIZE: u32 = 100;
 
 /// Maximum number of recipient entries accepted by a single
 /// [`CreatorKeysContract::airdrop_keys`] call.
@@ -1836,6 +1845,8 @@ pub enum DataKey {
     /// gated access (Issue #953). Absent means access gating is not configured
     /// for that creator and `subscribe` rejects.
     MinHoldForAccess(Address),
+    /// (creator) -> permanent whitelist disabled marker (Issue #998).
+    WhitelistPermanentlyDisabled(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2327,17 +2338,41 @@ fn whitelist_status(env: &Env, profile: &CreatorProfile) -> WhitelistStatus {
     }
 }
 
+pub fn is_whitelist_permanently_disabled(env: &Env, key_id: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&constants::storage::whitelist_permanently_disabled(key_id))
+        .unwrap_or(false)
+}
+
+pub fn is_wallet_whitelisted(env: &Env, key_id: &Address, wallet: &Address) -> bool {
+    let entry_key = constants::storage::whitelist_entry(key_id, wallet);
+    if let Some(is_approved) = env.storage().persistent().get::<DataKey, bool>(&entry_key) {
+        return is_approved;
+    }
+    if let Some(config) = read_whitelist_config(env, key_id) {
+        for address in config.addresses.iter() {
+            if address == *wallet {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn assert_whitelist_allows_buy(
     env: &Env,
     profile: &CreatorProfile,
     buyer: &Address,
 ) -> Result<(), ContractError> {
+    if is_whitelist_permanently_disabled(env, &profile.creator) {
+        return Ok(());
+    }
+
     let mode_key = constants::storage::whitelist_mode(&profile.creator);
     let is_mode_on: bool = env.storage().persistent().get(&mode_key).unwrap_or(false);
     if is_mode_on {
-        let entry_key = constants::storage::whitelist_entry(&profile.creator, buyer);
-        let is_approved: bool = env.storage().persistent().get(&entry_key).unwrap_or(false);
-        if !is_approved {
+        if !is_wallet_whitelisted(env, &profile.creator, buyer) {
             return Err(ContractError::NotWhitelisted);
         }
         return Ok(());
@@ -5412,6 +5447,18 @@ impl CreatorKeysContract {
                 count: 0,
                 average_score_scaled: 0,
             })
+    }
+
+    /// Purchases a key for `key_id`, checking the early-access whitelist gate if active.
+    /// Alias to [`Self::buy_key`].
+    pub fn buy(
+        env: Env,
+        key_id: Address,
+        buyer: Address,
+        payment: i128,
+        max_price: Option<i128>,
+    ) -> Result<u32, ContractError> {
+        Self::buy_key(env, key_id, buyer, payment, max_price)
     }
 
     pub fn buy_key(
@@ -12067,6 +12114,9 @@ impl CreatorKeysContract {
         if profile.creator != creator {
             return Err(ContractError::Unauthorized);
         }
+        if is_whitelist_permanently_disabled(&env, &creator) {
+            return Err(ContractError::WhitelistPermanentlyDisabled);
+        }
 
         let mode_key = constants::storage::whitelist_mode(&creator);
         env.storage().persistent().set(&mode_key, &true);
@@ -12080,20 +12130,24 @@ impl CreatorKeysContract {
         Ok(())
     }
 
-    pub fn disable_whitelist(env: Env, creator: Address) -> Result<(), ContractError> {
-        creator.require_auth();
-        let profile = read_registered_creator_profile(&env, &creator)?;
-        if profile.creator != creator {
+    pub fn disable_whitelist(env: Env, key_id: Address) -> Result<(), ContractError> {
+        key_id.require_auth();
+        let profile = read_registered_creator_profile(&env, &key_id)?;
+        if profile.creator != key_id {
             return Err(ContractError::Unauthorized);
         }
 
-        let mode_key = constants::storage::whitelist_mode(&creator);
+        let mode_key = constants::storage::whitelist_mode(&key_id);
         env.storage().persistent().set(&mode_key, &false);
         extend_key_ttl_to_full_window(&env, &mode_key);
 
+        let perm_key = constants::storage::whitelist_permanently_disabled(&key_id);
+        env.storage().persistent().set(&perm_key, &true);
+        extend_key_ttl_to_full_window(&env, &perm_key);
+
         env.events().publish(
-            events::whitelist_disabled_topics(&creator),
-            events::WhitelistDisabledEvent { creator },
+            events::whitelist_disabled_topics(&key_id),
+            events::WhitelistDisabledEvent { creator: key_id },
         );
 
         Ok(())
@@ -12109,10 +12163,22 @@ impl CreatorKeysContract {
         if profile.creator != creator {
             return Err(ContractError::Unauthorized);
         }
+        if is_whitelist_permanently_disabled(&env, &creator) {
+            return Err(ContractError::WhitelistPermanentlyDisabled);
+        }
 
         let entry_key = constants::storage::whitelist_entry(&creator, &address);
         env.storage().persistent().set(&entry_key, &true);
         extend_key_ttl_to_full_window(&env, &entry_key);
+
+        env.events().publish(
+            events::whitelist_updated_topics(&creator),
+            events::WhitelistUpdatedEvent {
+                creator: creator.clone(),
+                wallet: address.clone(),
+                allowed: true,
+            },
+        );
 
         env.events().publish(
             events::address_whitelisted_topics(&creator),
@@ -12124,25 +12190,87 @@ impl CreatorKeysContract {
 
     pub fn remove_from_whitelist(
         env: Env,
-        creator: Address,
-        address: Address,
+        key_id: Address,
+        wallet: Address,
     ) -> Result<(), ContractError> {
-        creator.require_auth();
-        let profile = read_registered_creator_profile(&env, &creator)?;
-        if profile.creator != creator {
+        key_id.require_auth();
+        let profile = read_registered_creator_profile(&env, &key_id)?;
+        if profile.creator != key_id {
             return Err(ContractError::Unauthorized);
         }
+        if is_whitelist_permanently_disabled(&env, &key_id) {
+            return Err(ContractError::WhitelistPermanentlyDisabled);
+        }
 
-        let entry_key = constants::storage::whitelist_entry(&creator, &address);
+        let entry_key = constants::storage::whitelist_entry(&key_id, &wallet);
         env.storage().persistent().set(&entry_key, &false);
         extend_key_ttl_to_full_window(&env, &entry_key);
 
         env.events().publish(
-            events::address_removed_topics(&creator),
-            events::AddressRemovedEvent { creator, address },
+            events::whitelist_updated_topics(&key_id),
+            events::WhitelistUpdatedEvent {
+                creator: key_id.clone(),
+                wallet: wallet.clone(),
+                allowed: false,
+            },
+        );
+
+        env.events().publish(
+            events::address_removed_topics(&key_id),
+            events::AddressRemovedEvent {
+                creator: key_id,
+                address: wallet,
+            },
         );
 
         Ok(())
+    }
+
+    /// Sets the early-access whitelist for `key_id` in a batch (up to 100 wallets),
+    /// activates the whitelist gate, and emits `WhitelistUpdatedEvent` for each wallet.
+    /// Creator-only.
+    pub fn set_whitelist(
+        env: Env,
+        key_id: Address,
+        wallets: Vec<Address>,
+    ) -> Result<(), ContractError> {
+        key_id.require_auth();
+        let profile = read_registered_creator_profile(&env, &key_id)?;
+        if profile.creator != key_id {
+            return Err(ContractError::Unauthorized);
+        }
+        if is_whitelist_permanently_disabled(&env, &key_id) {
+            return Err(ContractError::WhitelistPermanentlyDisabled);
+        }
+        if wallets.len() > MAX_WHITELIST_BATCH_SIZE {
+            return Err(ContractError::WhitelistTooLarge);
+        }
+
+        let mode_key = constants::storage::whitelist_mode(&key_id);
+        env.storage().persistent().set(&mode_key, &true);
+        extend_key_ttl_to_full_window(&env, &mode_key);
+
+        for wallet in wallets.iter() {
+            let entry_key = constants::storage::whitelist_entry(&key_id, &wallet);
+            env.storage().persistent().set(&entry_key, &true);
+            extend_key_ttl_to_full_window(&env, &entry_key);
+
+            env.events().publish(
+                events::whitelist_updated_topics(&key_id),
+                events::WhitelistUpdatedEvent {
+                    creator: key_id.clone(),
+                    wallet,
+                    allowed: true,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Read-only view: returns whether `wallet` is on `key_id`'s early-access whitelist.
+    pub fn is_whitelisted(env: Env, key_id: Address, wallet: Address) -> bool {
+        is_wallet_whitelisted(&env, &key_id, &wallet)
     }
 
     /// Admin sets the upper bound a creator may choose for their per-wallet
@@ -12217,6 +12345,9 @@ impl CreatorKeysContract {
     ) -> Result<(), ContractError> {
         caller.require_auth();
         assert_creator_or_admin(&env, &caller, &creator)?;
+        if enabled && is_whitelist_permanently_disabled(&env, &creator) {
+            return Err(ContractError::WhitelistPermanentlyDisabled);
+        }
         let mode_key = constants::storage::whitelist_mode(&creator);
         env.storage().persistent().set(&mode_key, &enabled);
         extend_key_ttl_to_full_window(&env, &mode_key);
@@ -12234,6 +12365,9 @@ impl CreatorKeysContract {
     ) -> Result<(), ContractError> {
         caller.require_auth();
         assert_creator_or_admin(&env, &caller, &creator)?;
+        if allowed && is_whitelist_permanently_disabled(&env, &creator) {
+            return Err(ContractError::WhitelistPermanentlyDisabled);
+        }
         let entry_key = constants::storage::whitelist_entry(&creator, &wallet);
         env.storage().persistent().set(&entry_key, &allowed);
         extend_key_ttl_to_full_window(&env, &entry_key);
@@ -12251,10 +12385,7 @@ impl CreatorKeysContract {
 
     /// Read-only view: whether `wallet` is on `creator`'s early-access whitelist.
     pub fn get_wallet_whitelist_status(env: Env, creator: Address, wallet: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&constants::storage::whitelist_entry(&creator, &wallet))
-            .unwrap_or(false)
+        is_wallet_whitelisted(&env, &creator, &wallet)
     }
 
     /// Admin sets the share of the protocol fee (in bps) paid to a referrer on
@@ -18595,6 +18726,9 @@ mod test_unique_traders;
 
 #[cfg(test)]
 mod test_lp_reward;
+
+#[cfg(test)]
+mod test_issue_998;
 
 #[cfg(test)]
 mod test_issue_1000;
